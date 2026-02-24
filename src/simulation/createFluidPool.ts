@@ -70,26 +70,31 @@ export function createFluidPool(
     opts?: PoolOptions,
 ): PoolAPI {
     // ── Config ──
-    const r = opts?.particleRadius ?? 8;
-    const N = opts?.numParticles ?? 4000;
+    const r = opts?.particleRadius ?? 12;
+    const N = opts?.numParticles ?? 1800;
     const grav = opts?.gravity ?? 100;
-    let fRat = opts?.flipRatio ?? 0.75;
+    let fRat = opts?.flipRatio ?? 0.9;
     const DT = opts?.dt ?? 1 / 120;
     const pIt = opts?.pressureIters ?? 30;
-    const sIt = opts?.sepIters ?? 5;
+    const sIt = opts?.sepIters ?? 2;
     const omega = opts?.overRelax ?? 1.9;
     const obsR = opts?.obstacleRadius ?? 100;
 
     const SUB = 2;
-    const DAMP = 0.97;
-    const WFRIC = 0.7;
-    const ODAMP = 0.3;
-    const OBS_IMPULSE = 400;
-    const RETF = 300;
-    const RETD = 0.85;
-    const MAXV = 600;
-    const SLEEPV = 3;
-    const SETTLE_DAMP = 0.90;
+    // 0.995 per substep ≈ 0.74 per second — mild air drag; keeps juggle energy alive.
+    const DAMP = 0.995;
+    const WFRIC = 0.7;     // wall friction
+    const RETF = 200;     // gentle gravity pull-back above pool (gravity does most of the work)
+    const MAXV = 1400;    // max particle speed
+    const SLEEPV = 3;       // sleep threshold (settled particles)
+    const SETTLE_DAMP = 0.90;   // extra damp for very slow in-pool particles
+    const OBS_REST = 0.3;    // obstacle restitution — 70% energy loss on bounce
+
+    // ── Obstacle / interaction ────────────────────────────────
+    const MIN_RADIUS = obsR * 0.8;  // resting hover radius
+    const MAX_RADIUS = obsR;        // max radius at full swipe speed
+    const VEL_SENSITIVITY = 0.02;       // how much mouse speed grows the radius
+
 
     // ── Cleanup tracking ──
     const rms: (() => void)[] = [];
@@ -155,6 +160,10 @@ export function createFluidPool(
 
     const uLen = (nx + 1) * ny, vLen = nx * (ny + 1), cLen = nx * ny;
     const U = new Float32Array(uLen), V = new Float32Array(vLen);
+    // preU/preV: post-P2G, pre-projection snapshot — required for correct FLIP delta.
+    // Preallocated once; filled with .set() each frame (zero allocations).
+    const preU = new Float32Array(uLen), preV = new Float32Array(vLen);
+    // prevU/prevV: previous-frame snapshot (kept for optional future use only).
     const pU = new Float32Array(uLen), pV = new Float32Array(vLen);
     const wU = new Float32Array(uLen), wV = new Float32Array(vLen);
     const P = new Float32Array(cLen);
@@ -182,7 +191,7 @@ export function createFluidPool(
             const xo = (row % 2) * r;
             for (let x = r + xo; x <= simW - r && idx < N; x += sp) {
                 px[idx] = x; py[idx] = y; vx[idx] = 0; vy[idx] = 0;
-                col[idx * 3] = 0.1; col[idx * 3 + 1] = 0.3; col[idx * 3 + 2] = 0.8;
+                col[idx * 3] = 1.0; col[idx * 3 + 1] = 1.0; col[idx * 3 + 2] = 1.0;
                 idx++;
             }
             row++;
@@ -191,10 +200,10 @@ export function createFluidPool(
             px[idx] = r + Math.random() * (simW - 2 * r);
             py[idx] = simH * 0.6 + Math.random() * simH * 0.35;
             vx[idx] = 0; vy[idx] = 0;
-            col[idx * 3] = 0.1; col[idx * 3 + 1] = 0.3; col[idx * 3 + 2] = 0.8;
+            col[idx * 3] = 1.0; col[idx * 3 + 1] = 1.0; col[idx * 3 + 2] = 1.0;
             idx++;
         }
-        U.fill(0); V.fill(0); pU.fill(0); pV.fill(0); P.fill(0);
+        U.fill(0); V.fill(0); preU.fill(0); preV.fill(0); pU.fill(0); pV.fill(0); P.fill(0);
     }
     initParticles();
 
@@ -218,31 +227,99 @@ export function createFluidPool(
             + (1 - fx) * fy * arr[iV(i0, j0 + 1)] + fx * fy * arr[iV(i0 + 1, j0 + 1)];
     }
 
-    // ── Pointer state ──
-    let ptrX = 0, ptrY = 0, ptrOn = false;
-    function s2s(cx: number, cy: number) {
+    // ── Obstacle / pointer state ───────────────────────────────
+    let obsX = simW * 0.5;   // obstacle centre (sim units)
+    let obsY = simH * 0.5;
+    let curObsR = 0;            // current radius (0 = inactive)
+    let obsVelX = 0;            // velocity stamped onto the grid
+    let obsVelY = 0;
+    let mouseDown = false;
+    let prevMouseX: number | null = null;
+    let prevMouseY: number | null = null;
+    let prevTime: number | null = null;
+    let mouseVelocity = 0;
+    let idleTimer = 0;            // setTimeout id for 100ms idle
+    let shrinkRaf = 0;            // rAF id for radius-shrink animation
+
+    /** Convert a client-space point to simulation space. */
+    function toSim(cx: number, cy: number) {
         const rc = canvas.getBoundingClientRect();
-        return { x: (cx - rc.left) / rc.width * simW, y: (cy - rc.top) / rc.height * simH };
+        return {
+            x: (cx - rc.left) / rc.width * simW,
+            y: (cy - rc.top) / rc.height * simH,
+        };
+    }
+
+    /**
+     * Place / move the invisible circular obstacle at sim-space (sx, sy).
+     * Computes obstacle velocity from displacement and stamps it onto every
+     * grid face inside the circle — this is the engine of the juggle.
+     * reset=true: snap with zero velocity (first contact).
+     */
+    function setObstacle(sx: number, sy: number, reset: boolean) {
+        if (reset) {
+            obsVelX = 0; obsVelY = 0;
+        } else {
+            obsVelX = (sx - obsX) / DT;
+            obsVelY = (sy - obsY) / DT;
+        }
+        obsX = sx; obsY = sy;
+    }
+
+    /**
+     * Called inside step(), AFTER p2g() normalises U/V and BEFORE the
+     * pre-projection snapshot.  Marks obstacle cells SOLID and stamps
+     * obsVelX/obsVelY onto every grid face inside the obstacle circle.
+     * This is equivalent to the reference setObstacle ‘f.u[i*n+j] = vx’ writes.
+     */
+    function stampObstacle() {
+        if (curObsR <= 0) return;
+        const r2 = curObsR * curObsR;
+        for (let j = 1; j < ny - 1; j++) {
+            for (let i = 1; i < nx - 1; i++) {
+                const dx = (i + 0.5) * h - obsX;
+                const dy = (j + 0.5) * h - obsY;
+                if (dx * dx + dy * dy < r2) {
+                    CT[iC(i, j)] = SOLID;
+                    U[iU(i, j)] = obsVelX;
+                    U[iU(i + 1, j)] = obsVelX;
+                    V[iV(i, j)] = obsVelY;
+                    V[iV(i, j + 1)] = obsVelY;
+                }
+            }
+        }
     }
 
     // ── Step ──
     function step() {
         pU.set(U); pV.set(V);
-        integrate(); bounds(); obstacle(); separate();
-        classify(); p2g(); pressure(); g2p();
+
+        integrate(); bounds(); separate();
+        classify();
+        p2g();
+
+        // Stamp obstacle velocity onto the grid AFTER p2g normalization,
+        // BEFORE pre-projection snapshot — this is how the juggle energy enters the fluid.
+        stampObstacle();
+
+        preU.set(U); preV.set(V);
+        pressure();
+        g2p();
+
         clampV(); sleep(); colors();
     }
 
     function integrate() {
         for (let i = 0; i < N; i++) {
             vx[i] *= DAMP; vy[i] *= DAMP;
-            vy[i] += grav * DT;
+            vy[i] += grav * DT;           // gravity always pulls down
             if (py[i] < poolTopY) {
-                // above pool: strong pull back down + damping
+                // Above the pool surface: add a gentle extra pull so stray
+                // particles always return, but don't kill horizontal juggle velocity.
                 vy[i] += RETF * DT;
-                vx[i] *= RETD; vy[i] *= RETD;
             } else {
-                // inside pool: settle particles to reduce jitter
+                // Inside the pool at rest: damp only very slow particles so they
+                // pack tightly and stop jittering.
                 const spd = Math.sqrt(vx[i] * vx[i] + vy[i] * vy[i]);
                 if (spd < 40) { vx[i] *= SETTLE_DAMP; vy[i] *= SETTLE_DAMP; }
             }
@@ -253,34 +330,41 @@ export function createFluidPool(
     function bounds() {
         const mn = r, mxX = simW - r, mxY = simH - r;
         for (let i = 0; i < N; i++) {
-            // left/right walls: kill horizontal vel, damp vertical hard
-            if (px[i] < mn)  { px[i] = mn;  vx[i] = -vx[i] * 0.1; vy[i] *= (1 - WFRIC); }
+
+            // ── Circular obstacle collision ──────────────────────────
+            // Push particle to the surface of the invisible obstacle circle,
+            // then reflect its inward velocity component with 70% energy loss.
+            if (curObsR > 0) {
+                const ddx = px[i] - obsX, ddy = py[i] - obsY;
+                const d2 = ddx * ddx + ddy * ddy;
+                const minD = curObsR + r;            // centre-to-centre minimum
+                if (d2 < minD * minD && d2 > 1e-8) {
+                    const d = Math.sqrt(d2);
+                    const nx = ddx / d, ny = ddy / d;
+                    // push particle to surface
+                    px[i] = obsX + nx * minD;
+                    py[i] = obsY + ny * minD;
+                    // reflect inward normal component, absorb 70% energy
+                    const vn = vx[i] * nx + vy[i] * ny;
+                    if (vn < 0) {
+                        vx[i] -= (1 + OBS_REST) * vn * nx;
+                        vy[i] -= (1 + OBS_REST) * vn * ny;
+                    }
+                    // inherit obstacle velocity (adds the juggle impulse)
+                    vx[i] += obsVelX * OBS_REST;
+                    vy[i] += obsVelY * OBS_REST;
+                }
+            }
+
+            // ── Tank walls ──────────────────────────────────────────
+            if (px[i] < mn) { px[i] = mn; vx[i] = -vx[i] * 0.1; vy[i] *= (1 - WFRIC); }
             if (px[i] > mxX) { px[i] = mxX; vx[i] = -vx[i] * 0.1; vy[i] *= (1 - WFRIC); }
-            // top wall: bounce weakly downward, kill most speed
-            if (py[i] < mn)  { py[i] = mn;  vy[i] = Math.abs(vy[i]) * 0.15; vx[i] *= (1 - WFRIC); }
-            // bottom wall: kill bounce
+            if (py[i] < mn) { py[i] = mn; vy[i] = Math.abs(vy[i]) * 0.15; vx[i] *= (1 - WFRIC); }
             if (py[i] > mxY) { py[i] = mxY; vy[i] = 0; vx[i] *= (1 - WFRIC); }
         }
     }
 
-    function obstacle() {
-        if (!ptrOn) return;
-        const R = obsR + r;
-        for (let i = 0; i < N; i++) {
-            const dx = px[i] - ptrX, dy = py[i] - ptrY;
-            const d = Math.sqrt(dx * dx + dy * dy);
-            if (d < R && d > 1e-6) {
-                const nx = dx / d, ny2 = dy / d;
-                px[i] = ptrX + nx * R; py[i] = ptrY + ny2 * R;
-                const vn = vx[i] * nx + vy[i] * ny2;
-                if (vn < 0) { vx[i] -= (1 + ODAMP) * vn * nx; vy[i] -= (1 + ODAMP) * vn * ny2; }
-                // impulse: closer particles get pushed harder
-                const strength = OBS_IMPULSE * (1 - d / R);
-                vx[i] += nx * strength * DT;
-                vy[i] += ny2 * strength * DT;
-            }
-        }
-    }
+
 
     function separate() {
         const md = 2 * r, md2 = md * md;
@@ -328,13 +412,8 @@ export function createFluidPool(
         CT.fill(AIR);
         for (let i = 0; i < nx; i++) { CT[iC(i, 0)] = SOLID; CT[iC(i, ny - 1)] = SOLID; }
         for (let j = 0; j < ny; j++) { CT[iC(0, j)] = SOLID; CT[iC(nx - 1, j)] = SOLID; }
-        if (ptrOn) {
-            const or2 = obsR * obsR;
-            for (let j = 1; j < ny - 1; j++) for (let i = 1; i < nx - 1; i++) {
-                const dx = (i + .5) * h - ptrX, dy = (j + .5) * h - ptrY;
-                if (dx * dx + dy * dy < or2) CT[iC(i, j)] = SOLID;
-            }
-        }
+        // Obstacle cells are marked SOLID in stampObstacle() (after p2g), not here,
+        // so that p2g zero-clears them and stampObstacle can then write the velocity.
         for (let p = 0; p < N; p++) {
             const ci = Math.floor(px[p] / h), cj = Math.floor(py[p] / h);
             if (ci >= 1 && ci < nx - 1 && cj >= 1 && cj < ny - 1 && CT[iC(ci, cj)] !== SOLID)
@@ -369,6 +448,7 @@ export function createFluidPool(
         }
         for (let i = 0; i < U.length; i++) U[i] = wU[i] > 1e-6 ? U[i] / wU[i] : 0;
         for (let i = 0; i < V.length; i++) V[i] = wV[i] > 1e-6 ? V[i] / wV[i] : 0;
+        // Zero wall-cell faces (obstacle faces are zeroed then re-stamped by stampObstacle)
         for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++)
             if (CT[iC(i, j)] === SOLID) {
                 U[iU(i, j)] = 0; U[iU(i + 1, j)] = 0; V[iV(i, j)] = 0; V[iV(i, j + 1)] = 0;
@@ -398,10 +478,16 @@ export function createFluidPool(
     }
 
     function g2p() {
+        // PIC/FLIP blend:
+        //   v_pic     = sample(U_post, p)          — fully grid-derived, dissipative
+        //   deltaGrid = sample(U_post, p) − sample(U_pre, p)  — what projection added
+        //   v_flip    = v_particle_old + deltaGrid  — keeps particle detail
+        //   v_new     = (1−fRat)*v_pic + fRat*v_flip
         for (let i = 0; i < N; i++) {
             const x = px[i], y = py[i];
             const picU = smpU(U, x, y), picV = smpV(V, x, y);
-            const dU = picU - smpU(pU, x, y), dV = picV - smpV(pV, x, y);
+            const dU = picU - smpU(preU, x, y);
+            const dV = picV - smpV(preV, x, y);
             vx[i] = (1 - fRat) * picU + fRat * (vx[i] + dU);
             vy[i] = (1 - fRat) * picV + fRat * (vy[i] + dV);
         }
@@ -422,25 +508,78 @@ export function createFluidPool(
     }
 
     function colors() {
+        // Static colour — obstacle is invisible; velocity-based tints would reveal it.
         for (let i = 0; i < N; i++) {
-            const t = Math.min(1, Math.sqrt(vx[i] * vx[i] + vy[i] * vy[i]) / 150);
-            col[i * 3] = 0.1 + t * 0.2; col[i * 3 + 1] = 0.3 + t * 0.5; col[i * 3 + 2] = 0.8 + t * 0.2;
+            col[i * 3] = 1.0; col[i * 3 + 1] = 1.0; col[i * 3 + 2] = 1.0;
         }
     }
 
-    // ── Events ──
-    listen(wrapper, 'pointermove', ((e: PointerEvent) => {
-        const p = s2s(e.clientX, e.clientY); ptrX = p.x; ptrY = p.y; ptrOn = true;
-    }) as EventListener);
-    listen(wrapper, 'pointerenter', ((e: PointerEvent) => {
-        const p = s2s(e.clientX, e.clientY); ptrX = p.x; ptrY = p.y; ptrOn = true;
-    }) as EventListener);
-    listen(wrapper, 'pointerleave', (() => { ptrOn = false; }) as EventListener);
-    listen(wrapper, 'touchmove', ((e: TouchEvent) => {
-        if (e.touches.length) { const t = e.touches[0], p = s2s(t.clientX, t.clientY); ptrX = p.x; ptrY = p.y; ptrOn = true; }
-    }) as EventListener, true);
-    listen(wrapper, 'touchend', (() => { ptrOn = false; }) as EventListener);
-    listen(wrapper, 'touchcancel', (() => { ptrOn = false; }) as EventListener);
+    // ── Interaction event handlers ────────────────────────────────
+
+    function startDrag(cx: number, cy: number) {
+        cancelAnimationFrame(shrinkRaf);
+        mouseDown = true;
+        prevMouseX = cx; prevMouseY = cy; prevTime = performance.now();
+        const s = toSim(cx, cy);
+        curObsR = MIN_RADIUS;
+        setObstacle(s.x, s.y, true);
+    }
+
+    function endDrag() {
+        mouseDown = false;
+        prevMouseX = null; prevMouseY = null; prevTime = null;
+        obsVelX = 0; obsVelY = 0;
+        // Smoothly shrink radius to zero so the obstacle fades out gracefully.
+        function shrink() {
+            if (dead) return;
+            curObsR *= 0.9;
+            if (curObsR > 0.5) { shrinkRaf = requestAnimationFrame(shrink); }
+            else { curObsR = 0; }
+        }
+        shrinkRaf = requestAnimationFrame(shrink);
+    }
+
+    function drag(cx: number, cy: number) {
+        // Velocity-based dynamic radius: fast swipe = bigger obstacle.
+        const now = performance.now();
+        if (prevMouseX !== null && prevMouseY !== null && prevTime !== null) {
+            const dt = (now - prevTime) / 1000;
+            if (dt > 0) {
+                const rc = canvas.getBoundingClientRect();
+                const scX = simW / rc.width;
+                const scY = simH / rc.height;
+                const ddx = (cx - prevMouseX) * scX;
+                const ddy = (cy - prevMouseY) * scY;
+                mouseVelocity = Math.sqrt(ddx * ddx + ddy * ddy) / dt;
+                const target = Math.min(MAX_RADIUS, MIN_RADIUS + mouseVelocity * VEL_SENSITIVITY);
+                curObsR = curObsR * 0.7 + target * 0.3;   // smooth blend
+            }
+        }
+        prevMouseX = cx; prevMouseY = cy; prevTime = now;
+
+        if (mouseDown) {
+            const s = toSim(cx, cy);
+            setObstacle(s.x, s.y, false);
+        } else {
+            startDrag(cx, cy);
+        }
+    }
+
+    // Idle timer: stop stamping velocity 100ms after last move
+    function resetIdle() {
+        clearTimeout(idleTimer);
+        idleTimer = window.setTimeout(() => { obsVelX = 0; obsVelY = 0; }, 100);
+    }
+
+    listen(wrapper, 'mousedown', ((e: MouseEvent) => startDrag(e.clientX, e.clientY)) as EventListener);
+    listen(window, 'mouseup', (endDrag) as EventListener);
+    listen(window, 'mousemove', ((e: MouseEvent) => { drag(e.clientX, e.clientY); resetIdle(); }) as EventListener);
+    listen(wrapper, 'mouseenter', ((e: MouseEvent) => startDrag(e.clientX, e.clientY)) as EventListener);
+    listen(window, 'blur', (endDrag) as EventListener);
+    listen(wrapper, 'touchstart', ((e: TouchEvent) => { e.preventDefault(); startDrag(e.touches[0].clientX, e.touches[0].clientY); }) as EventListener);
+    listen(wrapper, 'touchmove', ((e: TouchEvent) => { e.preventDefault(); drag(e.touches[0].clientX, e.touches[0].clientY); }) as EventListener);
+    listen(wrapper, 'touchend', ((e: TouchEvent) => { e.preventDefault(); endDrag(); }) as EventListener);
+
 
     // ── Render ──
     const posD = new Float32Array(N * 2);

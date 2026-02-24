@@ -7,13 +7,17 @@ export default function FluidCanvas() {
     const apiRef = useRef<PoolAPI | null>(null);
 
     const [paused] = useState(false);
-    const [flipRatio] = useState(0.75);
+    const [flipRatio] = useState(0.9);
 
     // one-off init + full cleanup
     useEffect(() => {
         const w = wrapperRef.current, c = canvasRef.current;
         if (!w || !c) return;
-        const api = createFluidPool(w, c);
+        const api = createFluidPool(w, c, {
+            particleRadius: 12,   // larger circles → less dense, less jitter
+            numParticles: 1800, // fewer particles → less wall-corner piling
+            sepIters: 2,    // fewer separation passes → softer, no explosive jitter
+        });
         apiRef.current = api;
         return () => { api.cleanup(); apiRef.current = null; };
     }, []);
