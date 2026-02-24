@@ -14,10 +14,12 @@ precision highp float;
 in vec2 a_pos;
 in vec3 a_color;
 in float a_shape;      // 0=circle 1=square 2=plus 3=cross 4=triangle
+in float a_rot;        // rotation in radians
 uniform vec2 u_res;
 uniform float u_ptSz;
 out vec3 v_col;
 flat out int v_shape;
+out float v_rot;
 void main(){
   gl_Position=vec4(a_pos.x/u_res.x*2.0-1.0,1.0-a_pos.y/u_res.y*2.0,0,1);
   // Decrease size of circle (0) and square (1) by 4px as requested
@@ -26,11 +28,13 @@ void main(){
   gl_PointSize=finalSz;
   v_col=a_color;
   v_shape=int(a_shape);
+  v_rot=a_rot;
 }`;
 const FRAG = `#version 300 es
 precision mediump float;
 in vec3 v_col;
 flat in int v_shape;
+in float v_rot;
 out vec4 o;
 
 float sdEquilateralTriangle(in vec2 p, in float r ) {
@@ -42,8 +46,18 @@ float sdEquilateralTriangle(in vec2 p, in float r ) {
     return -length(p)*sign(p.y);
 }
 
+vec2 rotate(vec2 v, float a) {
+	float s = sin(a);
+	float c = cos(a);
+	mat2 m = mat2(c, s, -s, c);
+	return m * v;
+}
+
 void main(){
   vec2 uv=(gl_PointCoord-0.5)*2.0;
+  // Apply per-particle rotation
+  uv = rotate(uv, v_rot);
+
   float alpha=0.0;
   vec3 finalCol=v_col;
 
@@ -224,12 +238,18 @@ export function createFluidPool(
     const aS = gl.getAttribLocation(prog, 'a_shape');
     gl.enableVertexAttribArray(aS);
     gl.vertexAttribPointer(aS, 1, gl.FLOAT, false, 0, 0);
+
+    const rBuf = gl.createBuffer()!;
+    gl.bindBuffer(gl.ARRAY_BUFFER, rBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, 4, gl.DYNAMIC_DRAW);
+    const aR = gl.getAttribLocation(prog, 'a_rot');
+    gl.enableVertexAttribArray(aR);
+    gl.vertexAttribPointer(aR, 1, gl.FLOAT, false, 0, 0);
     gl.bindVertexArray(null);
 
     rms.push(() => {
         gl.deleteProgram(prog); gl.deleteShader(vs); gl.deleteShader(fs);
-        gl.deleteBuffer(pBuf); gl.deleteBuffer(cBuf); gl.deleteBuffer(sBuf);
-        gl.deleteVertexArray(vao);
+        gl.deleteBuffer(pBuf); gl.deleteBuffer(cBuf); gl.deleteBuffer(sBuf); gl.deleteBuffer(rBuf); gl.deleteVertexArray(vao);
     });
 
     // ── Simulation state ──
@@ -245,9 +265,14 @@ export function createFluidPool(
     const vx = new Float32Array(N);
     const vy = new Float32Array(N);
     const col = new Float32Array(N * 3);
-    // Per-particle shape type: 0=circle, 1=square, 2=plus, 3=cross
     const shapeType = new Float32Array(N);
-    const shapeD = new Float32Array(N); // upload scratch
+    const rot = new Float32Array(N); // current angle
+    const rotV = new Float32Array(N); // rotation speed
+
+    // Transfer buffers for WebGL
+    const posD = new Float32Array(N * 2);
+    const shapeD = new Float32Array(N);
+    const rotD = new Float32Array(N);
 
     const uLen = (nx + 1) * ny, vLen = nx * (ny + 1), cLen = nx * ny;
     const U = new Float32Array(uLen), V = new Float32Array(vLen);
@@ -284,6 +309,8 @@ export function createFluidPool(
                 px[idx] = x; py[idx] = y; vx[idx] = 0; vy[idx] = 0;
                 col[idx * 3] = 1.0; col[idx * 3 + 1] = 1.0; col[idx * 3 + 2] = 1.0;
                 shapeType[idx] = idx % 5; // uniform distribution across 5 shapes
+                rot[idx] = Math.random() * Math.PI * 2;
+                rotV[idx] = (Math.random() - 0.5) * 4.0; // rotation speed -2 to 2 rad/s
                 idx++;
             }
             row++;
@@ -294,6 +321,8 @@ export function createFluidPool(
             vx[idx] = 0; vy[idx] = 0;
             col[idx * 3] = 1.0; col[idx * 3 + 1] = 1.0; col[idx * 3 + 2] = 1.0;
             shapeType[idx] = idx % 5;
+            rot[idx] = Math.random() * Math.PI * 2;
+            rotV[idx] = (Math.random() - 0.5) * 4.0;
             idx++;
         }
         U.fill(0); V.fill(0); preU.fill(0); preV.fill(0); pU.fill(0); pV.fill(0); P.fill(0);
@@ -925,12 +954,14 @@ export function createFluidPool(
             vy[i] = Math.sin(angle) * speed;
             // Randomise shape on spawn (0-4)
             shapeType[i] = Math.floor(Math.random() * 5);
+            // Randomize rotation on spawn
+            rot[i] = Math.random() * Math.PI * 2;
+            rotV[i] = (Math.random() - 0.5) * 6.0; // slightly faster for new ones
         }
     }) as EventListener);
 
 
     // ── Render ──
-    const posD = new Float32Array(N * 2);
     function render() {
         const cvs = gl!.canvas as HTMLCanvasElement;
         if (cvs.width !== cvs.clientWidth || cvs.height !== cvs.clientHeight) {
@@ -947,10 +978,16 @@ export function createFluidPool(
         gl!.bufferData(gl!.ARRAY_BUFFER, posD, gl!.DYNAMIC_DRAW);
         gl!.bindBuffer(gl!.ARRAY_BUFFER, cBuf);
         gl!.bufferData(gl!.ARRAY_BUFFER, col.subarray(0, N * 3), gl!.DYNAMIC_DRAW);
+
         // Upload shape types
         for (let i = 0; i < N; i++) shapeD[i] = shapeType[i];
         gl!.bindBuffer(gl!.ARRAY_BUFFER, sBuf);
         gl!.bufferData(gl!.ARRAY_BUFFER, shapeD, gl!.DYNAMIC_DRAW);
+
+        // Upload rotation
+        for (let i = 0; i < N; i++) rotD[i] = rot[i];
+        gl!.bindBuffer(gl!.ARRAY_BUFFER, rBuf);
+        gl!.bufferData(gl!.ARRAY_BUFFER, rotD, gl!.DYNAMIC_DRAW);
 
         // ptSz: r*2 in sim-space mapped to canvas px, then subtract 6px for size reduction
         const ptSz = Math.max(2, r * 2 * (cvs.width / simW) - 6);
@@ -967,7 +1004,11 @@ export function createFluidPool(
     let rafId = 0;
     function loop() {
         if (!dead) {
-            if (!paused) { for (let s = 0; s < SUB; s++) step(); }
+            if (!paused) {
+                for (let s = 0; s < SUB; s++) step();
+                // Increment rotation over time
+                for (let i = 0; i < N; i++) rot[i] += rotV[i] * DT;
+            }
             render();
             rafId = requestAnimationFrame(loop);
         }
