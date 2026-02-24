@@ -13,22 +13,73 @@ const VERT = `#version 300 es
 precision highp float;
 in vec2 a_pos;
 in vec3 a_color;
+in float a_shape;      // 0=circle 1=square 2=plus 3=cross 4=triangle
 uniform vec2 u_res;
 uniform float u_ptSz;
 out vec3 v_col;
+flat out int v_shape;
 void main(){
   gl_Position=vec4(a_pos.x/u_res.x*2.0-1.0,1.0-a_pos.y/u_res.y*2.0,0,1);
-  gl_PointSize=u_ptSz;
+  // Decrease size of circle (0) and square (1) by 4px as requested
+  float finalSz = u_ptSz;
+  if(a_shape < 1.5) finalSz = max(2.0, u_ptSz - 4.0);
+  gl_PointSize=finalSz;
   v_col=a_color;
+  v_shape=int(a_shape);
 }`;
 const FRAG = `#version 300 es
 precision mediump float;
 in vec3 v_col;
+flat in int v_shape;
 out vec4 o;
+
+float sdEquilateralTriangle(in vec2 p, in float r ) {
+    const float k = sqrt(3.0);
+    p.x = abs(p.x) - r;
+    p.y = p.y + r/k;
+    if( p.x+k*p.y>0.0 ) p = vec2(p.x-k*p.y,-k*p.x-p.y)/2.0;
+    p.x -= clamp( p.x, -2.0*r, 0.0 );
+    return -length(p)*sign(p.y);
+}
+
 void main(){
-  float d=length(gl_PointCoord-0.5)*2.0;
-  if(d>1.0)discard;
-  o=vec4(v_col,(1.0-smoothstep(0.8,1.0,d))*0.9);
+  vec2 uv=(gl_PointCoord-0.5)*2.0;
+  float alpha=0.0;
+  vec3 finalCol=v_col;
+
+  if(v_shape==0){
+    // circle
+    float d=length(uv);
+    alpha=1.0-smoothstep(0.82,1.0,d);
+  } else if(v_shape==1){
+    // square
+    float d=max(abs(uv.x),abs(uv.y));
+    alpha=1.0-smoothstep(0.82,0.98,d);
+  } else if(v_shape==2){
+    // plus (+): thin arms
+    float arm=0.08;
+    float dH=max(abs(uv.y)-arm, max(abs(uv.x)-1.0,0.0));
+    float dV=max(abs(uv.x)-arm, max(abs(uv.y)-1.0,0.0));
+    float d=min(dH,dV);
+    d=max(d,length(uv)-1.0);
+    alpha=1.0-smoothstep(0.0,0.04,d);
+  } else if(v_shape==3){
+    // cross (X): thin diagonal arms
+    vec2 r45=vec2((uv.x+uv.y)*0.7071,(uv.x-uv.y)*0.7071);
+    float arm=0.08;
+    float dH=max(abs(r45.y)-arm, max(abs(r45.x)-0.7071,0.0));
+    float dV=max(abs(r45.x)-arm, max(abs(r45.y)-0.7071,0.0));
+    float d=min(dH,dV);
+    d=max(d,length(uv)-1.0);
+    alpha=1.0-smoothstep(0.0,0.04,d);
+  } else {
+    // triangle: white fill
+    float d=sdEquilateralTriangle(uv, 0.85);
+    alpha=1.0-smoothstep(0.0,0.04,d);
+    finalCol=vec3(1.0);
+  }
+  if(alpha<0.01)discard;
+  o=vec4(finalCol,alpha*0.92);
 }`;
 
 // ═══ Constants ══════════════════════════════════════════════════
@@ -71,8 +122,8 @@ export function createFluidPool(
 ): PoolAPI {
     // ── Config ──
     const r = opts?.particleRadius ?? 12;
-    const N = opts?.numParticles ?? 1800;
-    const grav = opts?.gravity ?? 100;
+    const N = opts?.numParticles ?? 2800;
+    const grav = opts?.gravity ?? 200;          // ↑ stronger gravity for big splashes
     let fRat = opts?.flipRatio ?? 0.9;
     const DT = opts?.dt ?? 1 / 120;
     const pIt = opts?.pressureIters ?? 30;
@@ -81,31 +132,47 @@ export function createFluidPool(
     const obsR = opts?.obstacleRadius ?? 100;
 
     const SUB = 2;
-    const WFRIC = 0.7;     // wall friction
-    const RETF = 200;     // gentle gravity pull-back above pool
+    const WFRIC = 0.5;     // wall friction — less grip = more splash bounce
+    const RETF = 350;     // pull-back above pool
     const SLEEPV = 3;       // sleep threshold (settled particles)
     const SETTLE_DAMP = 0.90;    // extra damp for very slow in-pool particles
-    const OBS_REST = 0.3;     // obstacle restitution
+    const OBS_REST = 0.7;     // obstacle restitution — bouncier (was 0.3)
 
     // ── Air vs Water & Settle ────────────────────────────────
-    const AIR_GRAV_MULT = 16.5;      // falling in air is faster
-    const DAMP_AIR = 0.998;    // preserve momentum in air
-    const DAMP_WATER = 0.985;    // settling damping in water
-    const COOLDOWN_MS = 1200;     // time after mouse move to trigger settle mode
-    const MAXV_ACTIVE = 1400;     // higher speed allowed while juggling
-    const MAXV_REST = 600;      // lower speed for stability at rest
+    const AIR_GRAV_MULT = 28.0;      // ↑ fast free-fall for big flip arc
+    const DAMP_AIR = 0.999;    // almost no air drag → farther projectiles
+    const DAMP_WATER = 0.998;    // less damping in water — waves travel farther
+    const COOLDOWN_MS = 500;     // time after mouse move to trigger settle mode
+    const MAXV_ACTIVE = 3200;     // very fast during juggle
+    const MAXV_REST = 2200;       // higher resting cap so waves propagate wide
 
     // ── Jitter Reduction ─────────────────────────────────────
-    const CONTACT_REST = 0.05;     // inelastic contacts (0.0=stick, 1.0=bounce)
+    // const CONTACT_REST = 0.05; // Omitted: restitution disabled in separate() for stability
     const VISCOSITY = 0.02;     // XSPH smoothing factor
     const MAX_POS_CORR = r * 0.15; // limit positional push per iteration
     const COHESION = 0.005;    // subtle background attraction at rest
     const PARTICLE_GAP = r * 0.2;  // extra space between circles
 
+    // ── XSPH Viscosity (adaptive) ──────────────────────────────
+    const VISC_SPARSE = 0.0;    // near gaps / void edges: let particles flow freely
+    const VISC_DENSE = 0.04;   // packed pile: damp jitter
+    const VISC_DENSE_THRESH = 7;      // neighbour count above which dense coeff kicks in
+    const V_RADIUS = r * 3.0;// smoothing neighbourhood radius
+    const V_MAX_FIX = 200;    // max velocity correction per frame
+
+    // ── Heightfield re-leveling (B1) ──────────────────────────
+    // Divides pool into columns; pushes fluid from overfull→underfull columns.
+    const LEVEL_COLS = 32;    // vertical bins across X
+    const LEVEL_K_REST = 8.0;   // always-on leveling — strong so voids close fast
+    const LEVEL_K_REFILL = 20.0;  // burst leveling in REFILL state
+    const LEVEL_MAX_AX = 600;   // max lateral accel px/s² (was 80)
+    const REFILL_MS = 500;  // REFILL lasts 1s after interaction ends
+
+
     // ── Obstacle / interaction ────────────────────────────────
-    const MIN_RADIUS = obsR * 0.8;  // resting hover radius
-    const MAX_RADIUS = obsR;        // max radius at full swipe speed
-    const VEL_SENSITIVITY = 0.02;       // how much mouse speed grows the radius
+    const MIN_RADIUS = obsR * 0.6;  // resting hover radius (smaller = more surgical)
+    const MAX_RADIUS = obsR * 1.4;  // ↑ large radius at full speed = big wave wall
+    const VEL_SENSITIVITY = 0.04;   // ↑ more radius growth per speed unit
 
 
     // ── Cleanup tracking ──
@@ -149,11 +216,20 @@ export function createFluidPool(
     const aC = gl.getAttribLocation(prog, 'a_color');
     gl.enableVertexAttribArray(aC);
     gl.vertexAttribPointer(aC, 3, gl.FLOAT, false, 0, 0);
+
+    // Shape-type attribute buffer (float per particle: 0=circle,1=square,2=plus,3=cross)
+    const sBuf = gl.createBuffer()!;
+    gl.bindBuffer(gl.ARRAY_BUFFER, sBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, 4, gl.DYNAMIC_DRAW);
+    const aS = gl.getAttribLocation(prog, 'a_shape');
+    gl.enableVertexAttribArray(aS);
+    gl.vertexAttribPointer(aS, 1, gl.FLOAT, false, 0, 0);
     gl.bindVertexArray(null);
 
     rms.push(() => {
         gl.deleteProgram(prog); gl.deleteShader(vs); gl.deleteShader(fs);
-        gl.deleteBuffer(pBuf); gl.deleteBuffer(cBuf); gl.deleteVertexArray(vao);
+        gl.deleteBuffer(pBuf); gl.deleteBuffer(cBuf); gl.deleteBuffer(sBuf);
+        gl.deleteVertexArray(vao);
     });
 
     // ── Simulation state ──
@@ -169,6 +245,9 @@ export function createFluidPool(
     const vx = new Float32Array(N);
     const vy = new Float32Array(N);
     const col = new Float32Array(N * 3);
+    // Per-particle shape type: 0=circle, 1=square, 2=plus, 3=cross
+    const shapeType = new Float32Array(N);
+    const shapeD = new Float32Array(N); // upload scratch
 
     const uLen = (nx + 1) * ny, vLen = nx * (ny + 1), cLen = nx * ny;
     const U = new Float32Array(uLen), V = new Float32Array(vLen);
@@ -204,6 +283,7 @@ export function createFluidPool(
             for (let x = r + xo; x <= simW - r && idx < N; x += sp) {
                 px[idx] = x; py[idx] = y; vx[idx] = 0; vy[idx] = 0;
                 col[idx * 3] = 1.0; col[idx * 3 + 1] = 1.0; col[idx * 3 + 2] = 1.0;
+                shapeType[idx] = idx % 5; // uniform distribution across 5 shapes
                 idx++;
             }
             row++;
@@ -213,6 +293,7 @@ export function createFluidPool(
             py[idx] = simH * 0.6 + Math.random() * simH * 0.35;
             vx[idx] = 0; vy[idx] = 0;
             col[idx * 3] = 1.0; col[idx * 3 + 1] = 1.0; col[idx * 3 + 2] = 1.0;
+            shapeType[idx] = idx % 5;
             idx++;
         }
         U.fill(0); V.fill(0); preU.fill(0); preV.fill(0); pU.fill(0); pV.fill(0); P.fill(0);
@@ -251,8 +332,12 @@ export function createFluidPool(
     let prevTime: number | null = null;
     let mouseVelocity = 0;
     let lastMoveTime = 0;           // performance.now() of last drag/move
+    let refillStart = 0;           // when REFILL state began
     let idleTimer = 0;            // setTimeout id for 100ms idle
     let shrinkRaf = 0;            // rAF id for radius-shrink animation
+    // Sim interaction state: 'active' while mouse is down, 'refill' right after,
+    // 'rest' once the pool has settled back. Controls leveling strength + damping.
+    let simState: 'active' | 'refill' | 'rest' = 'rest';
 
     /** Convert a client-space point to simulation space. */
     function toSim(cx: number, cy: number) {
@@ -306,9 +391,23 @@ export function createFluidPool(
 
     // ── Step ──
     function step() {
+        // ── Update sim state machine ──
+        const nowMs = performance.now();
+        if (mouseDown) {
+            simState = 'active';
+        } else if (simState === 'active') {
+            // Transition: mouse just released → start REFILL
+            simState = 'refill';
+            refillStart = nowMs;
+        } else if (simState === 'refill' && nowMs - refillStart > REFILL_MS) {
+            simState = 'rest';
+        }
+
         pU.set(U); pV.set(V);
 
-        integrate(); bounds(); separate();
+        integrate();
+        applyRelevelingForce(); // lateral pressure to close voids
+        bounds(); separate();
         classify();
         p2g();
 
@@ -319,13 +418,15 @@ export function createFluidPool(
         preU.set(U); preV.set(V);
         pressure();
         g2p();
+        applyViscosity();
 
         clampV(); sleep(); colors();
     }
 
     function integrate() {
-        const now = performance.now();
-        const isSettling = (now - lastMoveTime > COOLDOWN_MS) && !mouseDown;
+        const isRefill = simState === 'refill';
+        const isRest = simState === 'rest';
+        const isSettling = isRefill || (isRest && !mouseDown && (performance.now() - lastMoveTime > COOLDOWN_MS));
 
         for (let i = 0; i < N; i++) {
             const isAir = py[i] < poolTopY - r;
@@ -333,22 +434,76 @@ export function createFluidPool(
 
             vx[i] *= damp; vy[i] *= damp;
 
-            // Gravity: boosted in air or during settling to return faster
+            // Gravity: boosted in air; extra during refill so particles fall back fast
             let gMult = 1.0;
             if (isAir) gMult = AIR_GRAV_MULT;
-            if (isSettling && py[i] < poolTopY + 100) gMult *= 1.5; // push down faster when settling
+            // During REFILL: pull airborne particles down faster to restore pool level
+            if (isRefill && isAir) gMult *= 2.8;
+            if (isSettling && py[i] < poolTopY + 100) gMult *= 1.5;
 
             vy[i] += grav * gMult * DT;
 
             if (isAir) {
-                // Return force: slightly stronger if we are very far up
                 vy[i] += RETF * DT * (py[i] < 0 ? 2.0 : 1.0);
             } else {
-                // In water: damp only very slow particles
                 const spd = Math.sqrt(vx[i] * vx[i] + vy[i] * vy[i]);
-                if (spd < 40) { vx[i] *= SETTLE_DAMP; vy[i] *= SETTLE_DAMP; }
+                // Stronger in-water damping during refill to settle the pile quickly
+                const settleMult = isRefill ? 0.85 : SETTLE_DAMP;
+                if (spd < 40) { vx[i] *= settleMult; vy[i] *= settleMult; }
             }
             px[i] += vx[i] * DT; py[i] += vy[i] * DT;
+        }
+    }
+
+    /**
+     * Heightfield-based lateral re-leveling (B1).
+     * Divides the pool X axis into LEVEL_COLS bins. Columns with more particles
+     * than average exert outward pressure; underfull columns pull fluid in.
+     * This reproduces the "hand in water" backfill: wherever you push particles
+     * away, a pressure gradient drives the rest back into the void.
+     */
+    function applyRelevelingForce() {
+        // Only apply within the pool region (poolTopY → bottom)
+        const poolH = simH - poolTopY;
+        if (poolH <= 0) return;
+
+        const colW = simW / LEVEL_COLS;
+        const fill = new Float32Array(LEVEL_COLS);
+
+        // count particles per column (pool region only)
+        for (let i = 0; i < N; i++) {
+            if (py[i] < poolTopY) continue;
+            const col = Math.max(0, Math.min(LEVEL_COLS - 1, Math.floor(px[i] / colW)));
+            fill[col]++;
+        }
+
+        // average fill
+        let fillSum = 0;
+        for (let c = 0; c < LEVEL_COLS; c++) fillSum += fill[c];
+        const fillAvg = fillSum / LEVEL_COLS;
+        if (fillAvg < 0.5) return; // pool nearly empty, nothing to do
+
+        // pressure = k * (fill[c] - avg)  – positive = overfull, negative = underfull
+        // Apply strongly in REFILL, moderately always (REST/ACTIVE) so gaps never linger
+        const kLevel = simState === 'refill' ? LEVEL_K_REFILL : LEVEL_K_REST;
+
+        // Pressure gradient per column: dpdx = p[c+1] - p[c-1]
+        const grad = new Float32Array(LEVEL_COLS);
+        for (let c = 0; c < LEVEL_COLS; c++) {
+            const pL = (c > 0) ? kLevel * (fill[c - 1] - fillAvg) : 0;
+            const pR = (c < LEVEL_COLS - 1) ? kLevel * (fill[c + 1] - fillAvg) : 0;
+            grad[c] = pR - pL; // positive → more on right → push left
+        }
+
+        // Apply acceleration to each particle in the pool
+        for (let i = 0; i < N; i++) {
+            if (py[i] < poolTopY) continue;
+            const col = Math.max(0, Math.min(LEVEL_COLS - 1, Math.floor(px[i] / colW)));
+            // Acceleration: -∇p  (move from high→low fill)
+            let ax = -grad[col];
+            // Clamp so this doesn't override strong splash velocities
+            ax = Math.max(-LEVEL_MAX_AX, Math.min(LEVEL_MAX_AX, ax));
+            vx[i] += ax * DT;
         }
     }
 
@@ -381,10 +536,11 @@ export function createFluidPool(
                 }
             }
 
-            // ── Tank walls ──────────────────────────────────────────
-            if (px[i] < mn) { px[i] = mn; vx[i] = -vx[i] * 0.1; vy[i] *= (1 - WFRIC); }
-            if (px[i] > mxX) { px[i] = mxX; vx[i] = -vx[i] * 0.1; vy[i] *= (1 - WFRIC); }
-            if (py[i] < mn) { py[i] = mn; vy[i] = Math.abs(vy[i]) * 0.15; vx[i] *= (1 - WFRIC); }
+            // ── Tank walls ────────────────────────────────────────────
+            // Raised restitution so waves bounce energetically off walls (was 0.1)
+            if (px[i] < mn) { px[i] = mn; vx[i] = -vx[i] * 0.65; vy[i] *= (1 - WFRIC); }
+            if (px[i] > mxX) { px[i] = mxX; vx[i] = -vx[i] * 0.65; vy[i] *= (1 - WFRIC); }
+            if (py[i] < mn) { py[i] = mn; vy[i] = Math.abs(vy[i]) * 0.50; vx[i] *= (1 - WFRIC); }
             if (py[i] > mxY) { py[i] = mxY; vy[i] = 0; vx[i] *= (1 - WFRIC); }
         }
     }
@@ -435,7 +591,10 @@ export function createFluidPool(
                                 const d = Math.sqrt(d2);
 
                                 // 1) Position Correction (clamped)
-                                let ov = (md - d) * 0.5;
+                                // Soft correction (0.2 weight) over multiple steps/iterations
+                                // prevents high-frequency glittering while still ensuring 
+                                // particles stack and repel from their outer surfaces.
+                                let ov = (md - d) * 0.2;
                                 ov = Math.min(ov, MAX_POS_CORR);
                                 const nx = dx / d, ny = dy / d;
                                 px[p] -= ov * nx; py[p] -= ov * ny;
@@ -443,15 +602,12 @@ export function createFluidPool(
 
                                 // 2) Inelastic Contact Impulse
                                 // Compute relative normal velocity
-                                const rvx = vx[p] - vx[q], rvy = vy[p] - vy[q];
-                                const rvn = rvx * nx + rvy * ny;
-                                if (rvn > 0) { // Particles are approaching
-                                    // Target post-collision relative normal velocity = -rvn * CONTACT_REST
-                                    // Impulse J = -(1 + restitution) * rvn / 2
-                                    const J = -(1 + CONTACT_REST) * rvn * 0.5;
-                                    vx[p] += J * nx; vy[p] += J * ny;
-                                    vx[q] -= J * nx; vy[q] -= J * ny;
-                                }
+                                // 2) Velocity impulse: DISABLED
+                                // Removing the contact impulse entirely eliminates the
+                                // high-frequency glittering/sparkling in dense regions.
+                                // Position correction (above) still prevents overlap;
+                                // the grid pressure solve handles flow forces instead.
+                                // const rvn = ...; — intentionally omitted.
 
                                 // Accumulate for XSPH Smoothing (optional pass later)
                                 avgVX += vx[q]; avgVY += vy[q]; count++;
@@ -555,11 +711,74 @@ export function createFluidPool(
         //   v_new     = (1−fRat)*v_pic + fRat*v_flip
         for (let i = 0; i < N; i++) {
             const x = px[i], y = py[i];
+            const isAir = y < poolTopY - r;
+
+            // Particles in air regime skip the grid projection update to avoid stalling
+            if (isAir) continue;
+
             const picU = smpU(U, x, y), picV = smpV(V, x, y);
             const dU = picU - smpU(preU, x, y);
             const dV = picV - smpV(preV, x, y);
             vx[i] = (1 - fRat) * picU + fRat * (vx[i] + dU);
             vy[i] = (1 - fRat) * picV + fRat * (vy[i] + dV);
+        }
+    }
+
+    function applyViscosity() {
+        // Adaptive XSPH:
+        //   Sparse zones (few neighbours) → VISC_SPARSE ≈ 0
+        //     Particles near voids stay free to flow back in.
+        //   Dense zones (many neighbours) → VISC_DENSE
+        //     Packed pile gets damping to stop jitter.
+        const vr = V_RADIUS, vr2 = vr * vr;
+
+        for (let i = 0; i < N; i++) {
+            if (py[i] < poolTopY - r) continue; // skip clearly airborne
+
+            const ci = Math.max(0, Math.min(hW - 1, Math.floor(px[i] / hCS)));
+            const cj = Math.max(0, Math.min(hH - 1, Math.floor(py[i] / hCS)));
+
+            let avgVX = 0, avgVY = 0, wsum = 0, count = 0;
+
+            for (let dj = -1; dj <= 1; dj++) {
+                const nj = cj + dj; if (nj < 0 || nj >= hH) continue;
+                for (let di = -1; di <= 1; di++) {
+                    const ni = ci + di; if (ni < 0 || ni >= hW) continue;
+                    const cell = ni + nj * hW;
+                    const end = hSt[cell] + hCnt[cell];
+                    for (let k = hSt[cell]; k < end; k++) {
+                        const j = hSo[k];
+                        if (i === j) continue;
+                        const dx = px[j] - px[i], dy = py[j] - py[i], d2 = dx * dx + dy * dy;
+                        if (d2 < vr2) {
+                            const d = Math.sqrt(d2);
+                            const q = d / vr;
+                            const w = (1 - q) * (1 - q);
+                            avgVX += vx[j] * w; avgVY += vy[j] * w;
+                            wsum += w; count++;
+                        }
+                    }
+                }
+            }
+
+            if (wsum > 0) {
+                // density factor: 0 = sparse (void edge), 1 = fully packed pile
+                const denseFactor = Math.min(1, count / VISC_DENSE_THRESH);
+                // During REFILL boost viscosity in dense regions to settle quickly;
+                // keep sparse regions free so the leveling force can move particles.
+                const refillBoost = simState === 'refill' ? 1.5 : 1.0;
+                const strength = (VISC_SPARSE + (VISC_DENSE - VISC_SPARSE) * denseFactor) * refillBoost;
+
+                let dvx = strength * (avgVX / wsum - vx[i]);
+                let dvy = strength * (avgVY / wsum - vy[i]);
+
+                const d2 = dvx * dvx + dvy * dvy;
+                if (d2 > V_MAX_FIX * V_MAX_FIX) {
+                    const s = V_MAX_FIX / Math.sqrt(d2);
+                    dvx *= s; dvy *= s;
+                }
+                vx[i] += dvx; vy[i] += dvy;
+            }
         }
     }
 
@@ -586,6 +805,12 @@ export function createFluidPool(
     }
 
     // ── Interaction event handlers ────────────────────────────────
+    // Pattern follows reference simulation:
+    //   mousedown / mouseenter  → startDrag
+    //   mousemove on wrapper    → drag  (stops the moment cursor leaves)
+    //   mouseleave on wrapper   → instant endDrag (kills obstacle immediately)
+    //   mouseup on window       → endDrag (handles button release outside wrapper)
+    //   blur on window          → endDrag (tab switch)
 
     function startDrag(cx: number, cy: number) {
         cancelAnimationFrame(shrinkRaf);
@@ -596,14 +821,23 @@ export function createFluidPool(
         setObstacle(s.x, s.y, true);
     }
 
+    /** Instantly kill the obstacle — called on leave so zero ghost circle remains. */
+    function killObstacle() {
+        cancelAnimationFrame(shrinkRaf);
+        curObsR = 0;
+        obsVelX = 0;
+        obsVelY = 0;
+    }
+
     function endDrag() {
         mouseDown = false;
         prevMouseX = null; prevMouseY = null; prevTime = null;
         obsVelX = 0; obsVelY = 0;
-        // Smoothly shrink radius to zero so the obstacle fades out gracefully.
+        // Smoothly shrink radius to zero so the obstacle fades out gracefully
+        // when mouse is released INSIDE the canvas.
         function shrink() {
             if (dead) return;
-            curObsR *= 0.9;
+            curObsR *= 0.75;          // faster shrink than before
             if (curObsR > 0.5) { shrinkRaf = requestAnimationFrame(shrink); }
             else { curObsR = 0; }
         }
@@ -628,11 +862,13 @@ export function createFluidPool(
         }
         prevMouseX = cx; prevMouseY = cy; prevTime = now;
 
+        const s = toSim(cx, cy);
         if (mouseDown) {
-            const s = toSim(cx, cy);
             setObstacle(s.x, s.y, false);
         } else {
-            startDrag(cx, cy);
+            // Hover (no button held): treat as light drag so the fluid flows
+            curObsR = MIN_RADIUS * 0.8;
+            setObstacle(s.x, s.y, false);
         }
     }
 
@@ -642,14 +878,55 @@ export function createFluidPool(
         idleTimer = window.setTimeout(() => { obsVelX = 0; obsVelY = 0; }, 100);
     }
 
+    // -- Desktop events --
+    // mousedown inside wrapper: begin drag
     listen(wrapper, 'mousedown', ((e: MouseEvent) => startDrag(e.clientX, e.clientY)) as EventListener);
+    // mouseup anywhere: end drag (handles release outside wrapper)
     listen(window, 'mouseup', (endDrag) as EventListener);
-    listen(window, 'mousemove', ((e: MouseEvent) => { drag(e.clientX, e.clientY); resetIdle(); }) as EventListener);
+    // mousemove ONLY on wrapper: obstacle strictly follows cursor within the zone
+    listen(wrapper, 'mousemove', ((e: MouseEvent) => { drag(e.clientX, e.clientY); resetIdle(); }) as EventListener);
+    // mouseenter: (re)start when cursor enters the wrapper
     listen(wrapper, 'mouseenter', ((e: MouseEvent) => startDrag(e.clientX, e.clientY)) as EventListener);
+    // mouseleave: INSTANTLY zero the obstacle so zero ghost circle is left outside
+    listen(wrapper, 'mouseleave', ((_e: MouseEvent) => killObstacle()) as EventListener);
+    // window blur: lost focus
     listen(window, 'blur', (endDrag) as EventListener);
+
+    // -- Touch events (on wrapper so they don't fire outside) --
     listen(wrapper, 'touchstart', ((e: TouchEvent) => { e.preventDefault(); startDrag(e.touches[0].clientX, e.touches[0].clientY); }) as EventListener);
     listen(wrapper, 'touchmove', ((e: TouchEvent) => { e.preventDefault(); drag(e.touches[0].clientX, e.touches[0].clientY); }) as EventListener);
     listen(wrapper, 'touchend', ((e: TouchEvent) => { e.preventDefault(); endDrag(); }) as EventListener);
+
+    // ── Click-to-spawn: teleport N/20 particles to the click point ──
+    // Attach to WRAPPER (not canvas) so we get the event in the same zone as drag.
+    // Use e.buttons===0 to confirm no button is held (pure click, not end-of-drag).
+    listen(wrapper, 'click', ((e: MouseEvent) => {
+        // Only fire on a real single click with no button held at time of event
+        if (e.buttons !== 0) return;
+        const s = toSim(e.clientX, e.clientY);
+        const spawnCount = Math.max(1, Math.round(N / 20));
+
+        // Build a pool of candidates and shuffle to pick random indices
+        const indices = Array.from({ length: N }, (_, i) => i);
+        for (let i = N - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            const tmp = indices[i]; indices[i] = indices[j]; indices[j] = tmp;
+        }
+
+        for (let k = 0; k < spawnCount; k++) {
+            const i = indices[k];
+            // Precise click origin (no jitter) as requested
+            px[i] = Math.max(r, Math.min(simW - r, s.x));
+            py[i] = Math.max(r, Math.min(simH - r, s.y));
+            // Strong outward burst so spawned particles fan out visibly
+            const angle = Math.random() * Math.PI * 2;
+            const speed = 200 + Math.random() * 600; // fast enough to see clearly
+            vx[i] = Math.cos(angle) * speed;
+            vy[i] = Math.sin(angle) * speed;
+            // Randomise shape on spawn (0-4)
+            shapeType[i] = Math.floor(Math.random() * 5);
+        }
+    }) as EventListener);
 
 
     // ── Render ──
@@ -670,8 +947,13 @@ export function createFluidPool(
         gl!.bufferData(gl!.ARRAY_BUFFER, posD, gl!.DYNAMIC_DRAW);
         gl!.bindBuffer(gl!.ARRAY_BUFFER, cBuf);
         gl!.bufferData(gl!.ARRAY_BUFFER, col.subarray(0, N * 3), gl!.DYNAMIC_DRAW);
+        // Upload shape types
+        for (let i = 0; i < N; i++) shapeD[i] = shapeType[i];
+        gl!.bindBuffer(gl!.ARRAY_BUFFER, sBuf);
+        gl!.bufferData(gl!.ARRAY_BUFFER, shapeD, gl!.DYNAMIC_DRAW);
 
-        const ptSz = r * 2 * (cvs.width / simW);
+        // ptSz: r*2 in sim-space mapped to canvas px, then subtract 6px for size reduction
+        const ptSz = Math.max(2, r * 2 * (cvs.width / simW) - 6);
         gl!.useProgram(prog);
         gl!.uniform2f(uRes, simW, simH);
         gl!.uniform1f(uPt, ptSz);
