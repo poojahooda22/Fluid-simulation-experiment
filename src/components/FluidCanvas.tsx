@@ -6,8 +6,8 @@ export default function FluidCanvas() {
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const apiRef = useRef<PoolAPI | null>(null);
 
-    const [paused, setPaused] = useState(false);
-    const [flipRatio, setFlipRatio] = useState(0.75);
+    const [paused] = useState(false);
+    const [flipRatio] = useState(0.75);
 
     // one-off init + full cleanup
     useEffect(() => {
