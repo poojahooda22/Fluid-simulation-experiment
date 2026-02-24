@@ -81,14 +81,26 @@ export function createFluidPool(
     const obsR = opts?.obstacleRadius ?? 100;
 
     const SUB = 2;
-    // 0.995 per substep ≈ 0.74 per second — mild air drag; keeps juggle energy alive.
-    const DAMP = 0.995;
     const WFRIC = 0.7;     // wall friction
-    const RETF = 200;     // gentle gravity pull-back above pool (gravity does most of the work)
-    const MAXV = 1400;    // max particle speed
+    const RETF = 200;     // gentle gravity pull-back above pool
     const SLEEPV = 3;       // sleep threshold (settled particles)
-    const SETTLE_DAMP = 0.90;   // extra damp for very slow in-pool particles
-    const OBS_REST = 0.3;    // obstacle restitution — 70% energy loss on bounce
+    const SETTLE_DAMP = 0.90;    // extra damp for very slow in-pool particles
+    const OBS_REST = 0.3;     // obstacle restitution
+
+    // ── Air vs Water & Settle ────────────────────────────────
+    const AIR_GRAV_MULT = 16.5;      // falling in air is faster
+    const DAMP_AIR = 0.998;    // preserve momentum in air
+    const DAMP_WATER = 0.985;    // settling damping in water
+    const COOLDOWN_MS = 1200;     // time after mouse move to trigger settle mode
+    const MAXV_ACTIVE = 1400;     // higher speed allowed while juggling
+    const MAXV_REST = 600;      // lower speed for stability at rest
+
+    // ── Jitter Reduction ─────────────────────────────────────
+    const CONTACT_REST = 0.05;     // inelastic contacts (0.0=stick, 1.0=bounce)
+    const VISCOSITY = 0.02;     // XSPH smoothing factor
+    const MAX_POS_CORR = r * 0.15; // limit positional push per iteration
+    const COHESION = 0.005;    // subtle background attraction at rest
+    const PARTICLE_GAP = r * 0.2;  // extra space between circles
 
     // ── Obstacle / interaction ────────────────────────────────
     const MIN_RADIUS = obsR * 0.8;  // resting hover radius
@@ -238,6 +250,7 @@ export function createFluidPool(
     let prevMouseY: number | null = null;
     let prevTime: number | null = null;
     let mouseVelocity = 0;
+    let lastMoveTime = 0;           // performance.now() of last drag/move
     let idleTimer = 0;            // setTimeout id for 100ms idle
     let shrinkRaf = 0;            // rAF id for radius-shrink animation
 
@@ -264,6 +277,7 @@ export function createFluidPool(
             obsVelY = (sy - obsY) / DT;
         }
         obsX = sx; obsY = sy;
+        lastMoveTime = performance.now();
     }
 
     /**
@@ -310,16 +324,27 @@ export function createFluidPool(
     }
 
     function integrate() {
+        const now = performance.now();
+        const isSettling = (now - lastMoveTime > COOLDOWN_MS) && !mouseDown;
+
         for (let i = 0; i < N; i++) {
-            vx[i] *= DAMP; vy[i] *= DAMP;
-            vy[i] += grav * DT;           // gravity always pulls down
-            if (py[i] < poolTopY) {
-                // Above the pool surface: add a gentle extra pull so stray
-                // particles always return, but don't kill horizontal juggle velocity.
-                vy[i] += RETF * DT;
+            const isAir = py[i] < poolTopY - r;
+            const damp = isAir ? DAMP_AIR : DAMP_WATER;
+
+            vx[i] *= damp; vy[i] *= damp;
+
+            // Gravity: boosted in air or during settling to return faster
+            let gMult = 1.0;
+            if (isAir) gMult = AIR_GRAV_MULT;
+            if (isSettling && py[i] < poolTopY + 100) gMult *= 1.5; // push down faster when settling
+
+            vy[i] += grav * gMult * DT;
+
+            if (isAir) {
+                // Return force: slightly stronger if we are very far up
+                vy[i] += RETF * DT * (py[i] < 0 ? 2.0 : 1.0);
             } else {
-                // Inside the pool at rest: damp only very slow particles so they
-                // pack tightly and stop jittering.
+                // In water: damp only very slow particles
                 const spd = Math.sqrt(vx[i] * vx[i] + vy[i] * vy[i]);
                 if (spd < 40) { vx[i] *= SETTLE_DAMP; vy[i] *= SETTLE_DAMP; }
             }
@@ -367,7 +392,12 @@ export function createFluidPool(
 
 
     function separate() {
-        const md = 2 * r, md2 = md * md;
+        const md = 2 * r + PARTICLE_GAP;
+        const md2 = md * md;
+
+        const now = performance.now();
+        const isSettling = (now - lastMoveTime > COOLDOWN_MS) && !mouseDown;
+
         for (let it = 0; it < sIt; it++) {
             hCnt.fill(0);
             for (let i = 0; i < N; i++) {
@@ -384,25 +414,65 @@ export function createFluidPool(
                 const c = ci + cj * hW;
                 hSo[hSt[c] + tmp[c]] = i; tmp[c]++;
             }
+
             for (let p = 0; p < N; p++) {
                 const ci = Math.max(0, Math.min(hW - 1, Math.floor(px[p] / hCS)));
                 const cj = Math.max(0, Math.min(hH - 1, Math.floor(py[p] / hCS)));
+
+                let avgVX = 0, avgVY = 0, count = 0;
+
                 for (let dj = -1; dj <= 1; dj++) {
                     const nj = cj + dj; if (nj < 0 || nj >= hH) continue;
                     for (let di = -1; di <= 1; di++) {
                         const ni = ci + di; if (ni < 0 || ni >= hW) continue;
                         const c = ni + nj * hW, end = hSt[c] + hCnt[c];
                         for (let k = hSt[c]; k < end; k++) {
-                            const q = hSo[k]; if (q <= p) continue;
+                            const q = hSo[k];
+                            if (q === p) continue;
+
                             const dx = px[q] - px[p], dy = py[q] - py[p], d2 = dx * dx + dy * dy;
                             if (d2 < md2 && d2 > 1e-8) {
-                                const d = Math.sqrt(d2), ov = (md - d) * 0.5;
-                                const nnx = dx / d, nny = dy / d;
-                                px[p] -= ov * nnx; py[p] -= ov * nny;
-                                px[q] += ov * nnx; py[q] += ov * nny;
+                                const d = Math.sqrt(d2);
+
+                                // 1) Position Correction (clamped)
+                                let ov = (md - d) * 0.5;
+                                ov = Math.min(ov, MAX_POS_CORR);
+                                const nx = dx / d, ny = dy / d;
+                                px[p] -= ov * nx; py[p] -= ov * ny;
+                                px[q] += ov * nx; py[q] += ov * ny;
+
+                                // 2) Inelastic Contact Impulse
+                                // Compute relative normal velocity
+                                const rvx = vx[p] - vx[q], rvy = vy[p] - vy[q];
+                                const rvn = rvx * nx + rvy * ny;
+                                if (rvn > 0) { // Particles are approaching
+                                    // Target post-collision relative normal velocity = -rvn * CONTACT_REST
+                                    // Impulse J = -(1 + restitution) * rvn / 2
+                                    const J = -(1 + CONTACT_REST) * rvn * 0.5;
+                                    vx[p] += J * nx; vy[p] += J * ny;
+                                    vx[q] -= J * nx; vy[q] -= J * ny;
+                                }
+
+                                // Accumulate for XSPH Smoothing (optional pass later)
+                                avgVX += vx[q]; avgVY += vy[q]; count++;
+
+                                // Subtle neighbor attraction (cohesion)
+                                if (d > md * 0.7) {
+                                    const strength = COHESION * (isSettling ? 2 : 1);
+                                    vx[p] += dx * strength; vy[p] += dy * strength;
+                                    vx[q] -= dx * strength; vy[q] -= dy * strength;
+                                }
                             }
                         }
                     }
+                }
+
+
+                // 3) XSPH Smoothing (Velocity Viscosity)
+                if (count > 0) {
+                    const viscosity = isSettling ? VISCOSITY * 2 : VISCOSITY;
+                    vx[p] += viscosity * (avgVX / count - vx[p]);
+                    vy[p] += viscosity * (avgVY / count - vy[p]);
                 }
             }
         }
@@ -494,10 +564,11 @@ export function createFluidPool(
     }
 
     function clampV() {
-        const m2 = MAXV * MAXV;
+        const maxV = mouseDown ? MAXV_ACTIVE : MAXV_REST;
+        const m2 = maxV * maxV;
         for (let i = 0; i < N; i++) {
             const v2 = vx[i] * vx[i] + vy[i] * vy[i];
-            if (v2 > m2) { const s = MAXV / Math.sqrt(v2); vx[i] *= s; vy[i] *= s; }
+            if (v2 > m2) { const s = maxV / Math.sqrt(v2); vx[i] *= s; vy[i] *= s; }
         }
     }
 

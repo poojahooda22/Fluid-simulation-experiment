@@ -15,7 +15,7 @@ export default function FluidCanvas() {
         if (!w || !c) return;
         const api = createFluidPool(w, c, {
             particleRadius: 12,   // larger circles → less dense, less jitter
-            numParticles: 1800, // fewer particles → less wall-corner piling
+            numParticles: 1200, // fewer particles → less wall-corner piling
             sepIters: 2,    // fewer separation passes → softer, no explosive jitter
         });
         apiRef.current = api;
