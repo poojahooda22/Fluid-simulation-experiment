@@ -13,11 +13,7 @@ export default function FluidCanvas() {
     useEffect(() => {
         const w = wrapperRef.current, c = canvasRef.current;
         if (!w || !c) return;
-        const api = createFluidPool(w, c, {
-            particleRadius: 12,   // larger circles → less dense, less jitter
-            numParticles: 1200, // fewer particles → less wall-corner piling
-            sepIters: 2,    // fewer separation passes → softer, no explosive jitter
-        });
+        const api = createFluidPool(w, c);
         apiRef.current = api;
         return () => { api.cleanup(); apiRef.current = null; };
     }, []);
