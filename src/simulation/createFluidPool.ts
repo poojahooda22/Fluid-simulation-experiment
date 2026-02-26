@@ -280,7 +280,6 @@ class FlipFluid {
     handleParticleCollisions(obstacleX: number, obstacleY: number, obstacleRadius: number, obstacleVelX: number, obstacleVelY: number) {
         const h = 1.0 / this.fInvSpacing;
         const r = this.particleRadius;
-        const or = obstacleRadius;
         const minDist = obstacleRadius + r;
         const minDist2 = minDist * minDist;
 
