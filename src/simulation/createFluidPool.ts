@@ -372,19 +372,19 @@ class FlipFluid {
 
             if (x < minX) {
                 x = minX;
-                this.particleVel[2 * i] *= -0.02;
+                this.particleVel[2 * i] *= -0.3;
             }
             if (x > maxX) {
                 x = maxX;
-                this.particleVel[2 * i] *= -0.02;
+                this.particleVel[2 * i] *= -0.3;
             }
             if (y < minY) {
                 y = minY;
-                this.particleVel[2 * i + 1] *= -0.02;
+                this.particleVel[2 * i + 1] *= -0.3;
             }
             if (y > maxY) {
                 y = maxY;
-                this.particleVel[2 * i + 1] *= -0.02;
+                this.particleVel[2 * i + 1] *= -0.3;
             }
             this.particlePos[2 * i] = x;
             this.particlePos[2 * i + 1] = y;
@@ -620,7 +620,7 @@ class FlipFluid {
                         this.v[top] - this.v[center];
 
                     if (this.particleRestDensity > 0.0 && compensateDrift) {
-                        const k = 0.1;
+                        const k = 0.5;
                         const compression = this.particleDensity[i * n + j] - this.particleRestDensity;
                         if (compression > 0.0)
                             div = div - k * compression;
@@ -721,7 +721,7 @@ class FlipFluid {
             this.updateParticleDensity();
             this.solveIncompressibility(numPressureIters, sdt, overRelaxation, compensateDrift);
             this.transferVelocities(false, flipRatio);
-            this.dampVelocities(0.005);
+            this.dampVelocities(0.001);
             this.clampVelocities(10.0);
         }
 
@@ -751,7 +751,7 @@ export function createFluidPool(
     const scene = {
         gravity: opts?.gravity !== undefined ? opts.gravity : -9.81,
         dt: opts?.dt ?? 1.0 / 60.0,
-        flipRatio: opts?.flipRatio ?? 0.65,
+        flipRatio: opts?.flipRatio ?? 0.90,
         numPressureIters: opts?.pressureIters ?? 80,
         numParticleIters: opts?.sepIters ?? 3,
         overRelaxation: opts?.overRelax ?? 1.8,
@@ -767,9 +767,9 @@ export function createFluidPool(
         showDebug: false,
         simTime: 0.0,
         idleWaveEnabled: true,
-        idleWaveStrength: 0.07,
-        idleWaveFrequency: 1.7,
-        idleWaveNoise: 0.04,
+        idleWaveStrength: 0.50,
+        idleWaveFrequency: 1.2,
+        idleWaveNoise: 0.06,
     };
 
     const simHeight = 3.0;
