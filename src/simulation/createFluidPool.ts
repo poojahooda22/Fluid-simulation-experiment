@@ -73,6 +73,7 @@ void main(){
 const FLUID_CELL = 0;
 const AIR_CELL = 1;
 const SOLID_CELL = 2;
+const OBSTACLE_REPULSION = 5.0; // outward push strength, tunable 1.0–5.0
 
 export interface PoolOptions {
     particleRadius?: number;
@@ -91,6 +92,7 @@ export interface PoolAPI {
     reset: () => void;
     setFlipRatio: (v: number) => void;
     setPaused: (v: boolean) => void;
+    setShowDebug: (v: boolean) => void;
 }
 
 function clamp(x: number, min: number, max: number) {
@@ -223,8 +225,8 @@ class FlipFluid {
             this.cellParticleIds[this.firstCellParticle[cellNr]] = i;
         }
 
-        // Increase the separation distance slightly to force gaps and reduce jitter
-        const minDist = 2.4 * this.particleRadius;
+        // Enforce a "safe space" between particles to prevent jamming and high velocity collisions
+        const minDist = 2.2 * this.particleRadius;
         const minDist2 = minDist * minDist;
 
         for (let iter = 0; iter < numIters; iter++) {
@@ -275,6 +277,20 @@ class FlipFluid {
                 }
             }
         }
+
+        // Clamp particles back into valid domain after separation
+        const h = 1.0 / this.fInvSpacing;
+        const r = this.particleRadius;
+        const bMinX = h + r;
+        const bMaxX = (this.fNumX - 1) * h - r;
+        const bMinY = h + r;
+        const bMaxY = (this.fNumY - 1) * h - r;
+        for (let i = 0; i < this.numParticles; i++) {
+            if (this.particlePos[2 * i] < bMinX) this.particlePos[2 * i] = bMinX;
+            if (this.particlePos[2 * i] > bMaxX) this.particlePos[2 * i] = bMaxX;
+            if (this.particlePos[2 * i + 1] < bMinY) this.particlePos[2 * i + 1] = bMinY;
+            if (this.particlePos[2 * i + 1] > bMaxY) this.particlePos[2 * i + 1] = bMaxY;
+        }
     }
 
     handleParticleCollisions(obstacleX: number, obstacleY: number, obstacleRadius: number, obstacleVelX: number, obstacleVelY: number) {
@@ -297,8 +313,43 @@ class FlipFluid {
             const d2 = dx * dx + dy * dy;
 
             if (d2 < minDist2) {
-                this.particleVel[2 * i] = obstacleVelX;
-                this.particleVel[2 * i + 1] = obstacleVelY;
+                const d = Math.sqrt(d2);
+
+                // Unit normal: obstacle center → particle
+                let nx: number, ny: number;
+                if (d > 1e-8) {
+                    nx = dx / d;
+                    ny = dy / d;
+                } else {
+                    nx = 1.0; ny = 0.0;
+                }
+
+                // A) Project position to obstacle surface
+                x = obstacleX + nx * minDist;
+                y = obstacleY + ny * minDist;
+
+                // B) Relative velocity (particle vs obstacle)
+                const relVx = this.particleVel[2 * i] - obstacleVelX;
+                const relVy = this.particleVel[2 * i + 1] - obstacleVelY;
+                const relVn = relVx * nx + relVy * ny;
+
+                // C) Strip inward normal component, keep tangential
+                let outVx = relVx;
+                let outVy = relVy;
+                if (relVn < 0.0) {
+                    outVx -= relVn * nx;
+                    outVy -= relVn * ny;
+                }
+
+                // D) Outward repulsion proportional to penetration depth
+                const overlap = minDist - d;
+                const repulse = OBSTACLE_REPULSION * (overlap / minDist);
+                outVx += repulse * nx;
+                outVy += repulse * ny;
+
+                // E) Convert back to world velocity
+                this.particleVel[2 * i] = outVx + obstacleVelX;
+                this.particleVel[2 * i + 1] = outVy + obstacleVelY;
             }
 
             if (x < minX) {
@@ -416,12 +467,12 @@ class FlipFluid {
                 x = clamp(x, h, (this.fNumX - 1) * h);
                 y = clamp(y, h, (this.fNumY - 1) * h);
 
-                const x0 = Math.min(Math.floor((x - dx) * h1), this.fNumX - 2);
-                const tx = ((x - dx) - x0 * h) * h1;
+                const x0 = Math.max(0, Math.min(Math.floor((x - dx) * h1), this.fNumX - 2));
+                const tx = clamp(((x - dx) - x0 * h) * h1, 0.0, 1.0);
                 const x1 = Math.min(x0 + 1, this.fNumX - 2);
 
-                const y0 = Math.min(Math.floor((y - dy) * h1), this.fNumY - 2);
-                const ty = ((y - dy) - y0 * h) * h1;
+                const y0 = Math.max(0, Math.min(Math.floor((y - dy) * h1), this.fNumY - 2));
+                const ty = clamp(((y - dy) - y0 * h) * h1, 0.0, 1.0);
                 const y1 = Math.min(y0 + 1, this.fNumY - 2);
 
                 const sx = 1.0 - tx;
@@ -439,29 +490,60 @@ class FlipFluid {
 
                 if (toGrid) {
                     const pv = this.particleVel[2 * i + component];
-                    f[nr0] += pv * d0; d[nr0] += d0;
-                    f[nr1] += pv * d1; d[nr1] += d1;
-                    f[nr2] += pv * d2; d[nr2] += d2;
-                    f[nr3] += pv * d3; d[nr3] += d3;
+                    f[nr0] += pv * d0;
+                    d[nr0] += d0;
+                    f[nr1] += pv * d1;
+                    d[nr1] += d1;
+                    f[nr2] += pv * d2;
+                    d[nr2] += d2;
+                    f[nr3] += pv * d3;
+                    d[nr3] += d3;
                 } else {
                     const offset = component === 0 ? n : 1;
-                    const valid0 = this.cellType[nr0] !== AIR_CELL || this.cellType[nr0 - offset] !== AIR_CELL ? 1.0 : 0.0;
-                    const valid1 = this.cellType[nr1] !== AIR_CELL || this.cellType[nr1 - offset] !== AIR_CELL ? 1.0 : 0.0;
-                    const valid2 = this.cellType[nr2] !== AIR_CELL || this.cellType[nr2 - offset] !== AIR_CELL ? 1.0 : 0.0;
-                    const valid3 = this.cellType[nr3] !== AIR_CELL || this.cellType[nr3 - offset] !== AIR_CELL ? 1.0 : 0.0;
+                    const valid0 =
+                        this.cellType[nr0] !== AIR_CELL ||
+                            this.cellType[nr0 - offset] !== AIR_CELL
+                            ? 1.0
+                            : 0.0;
+                    const valid1 =
+                        this.cellType[nr1] !== AIR_CELL ||
+                            this.cellType[nr1 - offset] !== AIR_CELL
+                            ? 1.0
+                            : 0.0;
+                    const valid2 =
+                        this.cellType[nr2] !== AIR_CELL ||
+                            this.cellType[nr2 - offset] !== AIR_CELL
+                            ? 1.0
+                            : 0.0;
+                    const valid3 =
+                        this.cellType[nr3] !== AIR_CELL ||
+                            this.cellType[nr3 - offset] !== AIR_CELL
+                            ? 1.0
+                            : 0.0;
 
                     const v = this.particleVel[2 * i + component];
-                    const weight = valid0 * d0 + valid1 * d1 + valid2 * d2 + valid3 * d3;
+                    const denom = valid0 * d0 + valid1 * d1 + valid2 * d2 + valid3 * d3;
 
-                    if (weight > 0.0) {
-                        const picV = (valid0 * d0 * f[nr0] + valid1 * d1 * f[nr1] + valid2 * d2 * f[nr2] + valid3 * d3 * f[nr3]) / weight;
-                        const corr = (valid0 * d0 * (f[nr0] - prevF[nr0]) + valid1 * d1 * (f[nr1] - prevF[nr1])
-                            + valid2 * d2 * (f[nr2] - prevF[nr2]) + valid3 * d3 * (f[nr3] - prevF[nr3])) / weight;
+                    if (denom > 0.0) {
+                        const picV =
+                            (valid0 * d0 * f[nr0] +
+                                valid1 * d1 * f[nr1] +
+                                valid2 * d2 * f[nr2] +
+                                valid3 * d3 * f[nr3]) /
+                            denom;
+                        const corr =
+                            (valid0 * d0 * (f[nr0] - prevF[nr0]) +
+                                valid1 * d1 * (f[nr1] - prevF[nr1]) +
+                                valid2 * d2 * (f[nr2] - prevF[nr2]) +
+                                valid3 * d3 * (f[nr3] - prevF[nr3])) /
+                            denom;
                         const flipV = v + corr;
 
-                        this.particleVel[2 * i + component] = (1.0 - flipRatio) * picV + flipRatio * flipV;
+                        this.particleVel[2 * i + component] =
+                            (1.0 - flipRatio) * picV + flipRatio * flipV;
                     }
                 }
+
             }
 
             if (toGrid) {
@@ -471,11 +553,16 @@ class FlipFluid {
                 }
                 for (let i = 0; i < this.fNumX; i++) {
                     for (let j = 0; j < this.fNumY; j++) {
-                        const solid = this.cellType[i * n + j] === SOLID_CELL;
-                        if (solid || (i > 0 && this.cellType[(i - 1) * n + j] === SOLID_CELL))
-                            this.u[i * n + j] = this.prevU[i * n + j];
-                        if (solid || (j > 0 && this.cellType[i * n + j - 1] === SOLID_CELL))
-                            this.v[i * n + j] = this.prevV[i * n + j];
+                        const idx = i * n + j;
+                        const solid = this.cellType[idx] === SOLID_CELL;
+                        if (solid || (i > 0 && this.cellType[(i - 1) * n + j] === SOLID_CELL)) {
+                            const wallFace = i <= 1 || i >= this.fNumX - 1 || j === 0;
+                            this.u[idx] = wallFace ? 0.0 : this.prevU[idx];
+                        }
+                        if (solid || (j > 0 && this.cellType[i * n + j - 1] === SOLID_CELL)) {
+                            const wallFace = i === 0 || i >= this.fNumX - 1 || j <= 1;
+                            this.v[idx] = wallFace ? 0.0 : this.prevV[idx];
+                        }
                     }
                 }
             }
@@ -515,7 +602,7 @@ class FlipFluid {
                         this.v[top] - this.v[center];
 
                     if (this.particleRestDensity > 0.0 && compensateDrift) {
-                        const k = 1.0;
+                        const k = 0.1;
                         const compression = this.particleDensity[i * n + j] - this.particleRestDensity;
                         if (compression > 0.0)
                             div = div - k * compression;
@@ -530,6 +617,28 @@ class FlipFluid {
                     this.v[center] -= sy0 * p;
                     this.v[top] += sy1 * p;
                 }
+            }
+        }
+    }
+
+    dampVelocities(damping: number) {
+        const scale = 1.0 - damping;
+        for (let i = 0; i < this.numParticles; i++) {
+            this.particleVel[2 * i] *= scale;
+            this.particleVel[2 * i + 1] *= scale;
+        }
+    }
+
+    clampVelocities(maxSpeed: number) {
+        const maxSpeed2 = maxSpeed * maxSpeed;
+        for (let i = 0; i < this.numParticles; i++) {
+            const vx = this.particleVel[2 * i];
+            const vy = this.particleVel[2 * i + 1];
+            const speed2 = vx * vx + vy * vy;
+            if (speed2 > maxSpeed2) {
+                const s = maxSpeed / Math.sqrt(speed2);
+                this.particleVel[2 * i] *= s;
+                this.particleVel[2 * i + 1] *= s;
             }
         }
     }
@@ -549,13 +658,14 @@ class FlipFluid {
 
         for (let step = 0; step < numSubSteps; step++) {
             this.integrateParticles(sdt, gravity);
+            this.handleParticleCollisions(obstacleX, obstacleY, obstacleRadius, obstacleVelX, obstacleVelY);
             if (separateParticles)
                 this.pushParticlesApart(numParticleIters);
-            this.handleParticleCollisions(obstacleX, obstacleY, obstacleRadius, obstacleVelX, obstacleVelY);
             this.transferVelocities(true, flipRatio);
             this.updateParticleDensity();
             this.solveIncompressibility(numPressureIters, sdt, overRelaxation, compensateDrift);
             this.transferVelocities(false, flipRatio);
+            this.clampVelocities(10.0);
         }
 
         this.updateParticleColors();
@@ -584,9 +694,9 @@ export function createFluidPool(
     const scene = {
         gravity: opts?.gravity !== undefined ? opts.gravity : -9.81,
         dt: opts?.dt ?? 1.0 / 60.0,
-        flipRatio: opts?.flipRatio ?? 0.9,
-        numPressureIters: opts?.pressureIters ?? 50,
-        numParticleIters: opts?.sepIters ?? 4, // More separation iterations to fix bottom jitter
+        flipRatio: opts?.flipRatio ?? 0.8,
+        numPressureIters: opts?.pressureIters ?? 80,
+        numParticleIters: opts?.sepIters ?? 2,
         overRelaxation: opts?.overRelax ?? 1.9,
         compensateDrift: true,
         separateParticles: true,
@@ -596,13 +706,14 @@ export function createFluidPool(
         obstacleVelX: 0.0,
         obstacleVelY: 0.0,
         paused: false,
-        frameNr: 0
+        frameNr: 0,
+        showDebug: false,
     };
 
     const simHeight = 3.0;
     const cScale = (canvas.clientHeight || window.innerHeight) / simHeight;
     const simWidth = (canvas.clientWidth || window.innerWidth) / cScale;
-    const res = 100;
+    const res = 70; // Decrease resolution to enlarge tracking grid + physical particles safely
 
     const tankHeight = 1.0 * simHeight;
     const tankWidth = 1.0 * simWidth;
@@ -614,24 +725,29 @@ export function createFluidPool(
     const relWaterWidth = 0.40;
 
     // compute number of particles
-    const r = 0.4 * h; // increased radius
-    const dx = 2.0 * r;
+    const r = 0.4 * h; // Revert to stable FLIP ratio so physics don't explode
+    const spawnSpacing = 2.2 * r; // Adds a safe space physical gap between particles
+    const dx = spawnSpacing;
     const dy = Math.sqrt(3.0) / 2.0 * dx;
 
-    const numX = Math.floor((relWaterWidth * tankWidth - 2.0 * h - 2.0 * r) / dx);
-    const numY = Math.floor((relWaterHeight * tankHeight - 2.0 * h - 2.0 * r) / dy);
-    // Allow room to spawn thousands of extra particles by clicking
-    const maxParticles = numX * numY + 5000;
+    // Use Math.round to preserve the exact field area when particles are larger
+    const numX = Math.round((relWaterWidth * tankWidth - 2.0 * h - 2.0 * r) / dx);
+    const numY = Math.round((relWaterHeight * tankHeight - 2.0 * h - 2.0 * r) / dy);
+    // Allow room to spawn thousands of extra particles by clicking. 
+    // Since dropCount is 540, we need a large buffer.
+    const maxParticles = numX * numY + 3000;
 
     // create fluid
     const f = new FlipFluid(density, tankWidth, tankHeight, h, r, maxParticles);
 
     // create particles
-    f.numParticles = numX * numY;
+    const initialParticles = numX * numY;
+    f.numParticles = initialParticles;
+    let spawnIndex = initialParticles;
     let p = 0;
     for (let i = 0; i < numX; i++) {
         for (let j = 0; j < numY; j++) {
-            f.particlePos[p++] = h + r + dx * i + (j % 2 === 0 ? 0.0 : r);
+            f.particlePos[p++] = h + r + dx * i + (j % 2 === 0 ? 0.0 : 0.5 * dx);
             f.particlePos[p++] = h + r + dy * j;
         }
     }
@@ -651,7 +767,7 @@ export function createFluidPool(
     const gl = canvas.getContext('webgl2', { alpha: true, premultipliedAlpha: false });
     if (!gl) {
         console.warn('No WebGL2');
-        return { cleanup() { }, reset() { }, setFlipRatio() { }, setPaused() { } };
+        return { cleanup() { }, reset() { }, setFlipRatio() { }, setPaused() { }, setShowDebug() { } };
     }
 
     const vs = compile(gl, gl.VERTEX_SHADER, VERT);
@@ -687,7 +803,10 @@ export function createFluidPool(
     gl.attachShader(m_prog, m_vs); gl.attachShader(m_prog, m_fs);
     gl.linkProgram(m_prog);
 
-    // variables omitted as the obstacle mesh is no longer drawn
+    const m_uRes = gl.getUniformLocation(m_prog, 'u_res')!;
+    const m_uCol = gl.getUniformLocation(m_prog, 'u_color')!;
+    const m_uTrans = gl.getUniformLocation(m_prog, 'u_translation')!;
+    const m_uScale = gl.getUniformLocation(m_prog, 'u_scale')!;
 
     // Create disk mesh
     const numSegs = 50;
@@ -733,12 +852,21 @@ export function createFluidPool(
         rms.push(() => el.removeEventListener(t, fn, o));
     };
 
+    const MOUSE_MAX_SPEED = 15.0; // clamp crazy interactions
+
     function setObstacle(x: number, y: number, reset: boolean) {
         let vx = 0.0;
         let vy = 0.0;
         if (!reset) {
             vx = (x - scene.obstacleX) / scene.dt;
             vy = (y - scene.obstacleY) / scene.dt;
+
+            // Limit maximum obstacle speed to prevent physics explosions
+            const speed = Math.sqrt(vx * vx + vy * vy);
+            if (speed > MOUSE_MAX_SPEED) {
+                vx = (vx / speed) * MOUSE_MAX_SPEED;
+                vy = (vy / speed) * MOUSE_MAX_SPEED;
+            }
         }
 
         scene.obstacleX = x;
@@ -774,25 +902,33 @@ export function createFluidPool(
         const y = (canvas.clientHeight - my) / cScale; // y-axis up
 
         // Drop a cluster of particles
-        const dropCount = 40;
+        const dropCount = 540;
 
         for (let i = 0; i < dropCount; i++) {
-            if (f.numParticles >= f.maxParticles) break;
+            let idx = f.numParticles;
+            if (f.numParticles >= f.maxParticles) {
+                // Recycle oldest spawned particle (ring buffer from initialParticles to maxParticles)
+                const poolSize = f.maxParticles - initialParticles;
+                if (poolSize <= 0) break; // fallback if no extra buffer 
+                idx = initialParticles + ((spawnIndex - initialParticles) % poolSize);
+            } else {
+                f.numParticles++;
+            }
+            spawnIndex++;
 
-            const idx = f.numParticles;
-            f.particlePos[2 * idx] = x;
-            f.particlePos[2 * idx + 1] = y;
+            // Random horizontal cluster around click, slightly randomized Y
+            const spreadX = (Math.random() - 0.5) * 0.4;
+            const spreadY = (Math.random() - 0.5) * 0.4;
 
-            // Wavy / fanning out burst
-            const angle = Math.random() * Math.PI * 2;
-            const speed = 3.0 + Math.random() * 5.0; // fast enough to fan out clearly
+            f.particlePos[2 * idx] = x + spreadX;
+            f.particlePos[2 * idx + 1] = y + spreadY;
 
-            f.particleVel[2 * idx] = Math.cos(angle) * speed;
-            f.particleVel[2 * idx + 1] = Math.sin(angle) * speed - 2.0; // radial outward + downward bias
-
-            f.numParticles++;
+            // Straight downward bias, slower speed per user request
+            f.particleVel[2 * idx] = (Math.random() - 0.5) * 1.0;
+            f.particleVel[2 * idx + 1] = -1.0 - Math.random() * 2.0;
         }
     }
+
 
     function handlePointerMove(cx: number, cy: number) {
         const rc = canvas.getBoundingClientRect();
@@ -844,6 +980,28 @@ export function createFluidPool(
                     scene.obstacleX, scene.obstacleY, scene.obstacleRadius, scene.obstacleVelX, scene.obstacleVelY
                 );
                 scene.frameNr++;
+
+                // Debug: highlight particles near obstacle
+                if (scene.showDebug && scene.obstacleX > -5.0) {
+                    const debugR2 = (scene.obstacleRadius + f.particleRadius) ** 2;
+                    let maxOverlap = 0, nearCount = 0;
+                    for (let i = 0; i < f.numParticles; i++) {
+                        const ddx = f.particlePos[2 * i] - scene.obstacleX;
+                        const ddy = f.particlePos[2 * i + 1] - scene.obstacleY;
+                        const dist2 = ddx * ddx + ddy * ddy;
+                        if (dist2 < debugR2) {
+                            f.particleColor[3 * i] = 1.0;
+                            f.particleColor[3 * i + 1] = 0.3;
+                            f.particleColor[3 * i + 2] = 0.0;
+                            nearCount++;
+                            const overlap = Math.sqrt(debugR2) - Math.sqrt(dist2);
+                            if (overlap > maxOverlap) maxOverlap = overlap;
+                        }
+                    }
+                    if (scene.frameNr % 120 === 0 && nearCount > 0) {
+                        console.log(`[DEBUG] ${nearCount} particles in obstacle zone, max overlap: ${maxOverlap.toFixed(4)}`);
+                    }
+                }
             }
 
             // Render
@@ -877,9 +1035,8 @@ export function createFluidPool(
             gl!.drawArrays(gl!.POINTS, 0, f.numParticles);
             gl!.bindVertexArray(null);
 
-            // Draw obstacle (disabled to keep invisible on drag)
-            /*
-            if (scene.obstacleX > -5.0) {
+            // Draw obstacle disk (debug only)
+            if (scene.showDebug && scene.obstacleX > -5.0) {
                 gl!.useProgram(m_prog);
                 gl!.uniform2f(m_uRes, simWidth, simHeight);
                 gl!.uniform3f(m_uCol, 1.0, 0.0, 0.0);
@@ -890,7 +1047,6 @@ export function createFluidPool(
                 gl!.drawElements(gl!.TRIANGLES, 3 * numSegs, gl!.UNSIGNED_SHORT, 0);
                 gl!.bindVertexArray(null);
             }
-            */
 
             rafId = requestAnimationFrame(loop);
         }
@@ -912,5 +1068,6 @@ export function createFluidPool(
         reset: () => { },
         setFlipRatio: (v: number) => { scene.flipRatio = v; },
         setPaused: (v: boolean) => { scene.paused = v; },
+        setShowDebug: (v: boolean) => { scene.showDebug = v; },
     };
 }
