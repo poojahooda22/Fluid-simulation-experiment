@@ -77,7 +77,7 @@ const OBSTACLE_REPULSION = 5.0; // outward push strength, tunable 1.0–5.0
 
 // ═══ Particle Cleanup Tuning ═════════════════════════════════════
 const SPAWN_THROTTLE_THRESHOLD = 0.90; // fraction of maxParticles before throttling
-const SPAWN_THROTTLE_FACTOR = 0.3;    // fraction of dropCount allowed when throttled
+const SPAWN_THROTTLE_FACTOR = 0.9;    // fraction of dropCount allowed when throttled
 
 export interface PoolOptions {
     particleRadius?: number;
@@ -767,7 +767,7 @@ export function createFluidPool(
         showDebug: false,
         simTime: 0.0,
         idleWaveEnabled: true,
-        idleWaveStrength: 0.50,
+        idleWaveStrength: 0.60,
         idleWaveFrequency: 1.2,
         idleWaveNoise: 0.06,
     };
@@ -801,9 +801,14 @@ export function createFluidPool(
     const wallPad = r + gapSim * 0.5;
     const numX = Math.round((relWaterWidth * tankWidth - 2.0 * h - 2.0 * wallPad) / dx);
     const numY = Math.round((relWaterHeight * tankHeight - 2.0 * h - 2.0 * wallPad) / dy);
-    // Allow room to spawn thousands of extra particles by clicking.
-    // Since dropCount is 540, we need a large buffer.
-    const maxParticles = numX * numY + 3000;
+
+    // Geometry-based particle targets: full-tank hex capacity × fill fraction
+    const fullNumX = Math.round((tankWidth - 2.0 * h - 2.0 * wallPad) / dx);
+    const fullNumY = Math.round((tankHeight - h - 2.0 * wallPad) / dy);
+    const tankCapacity = fullNumX * fullNumY;
+    const TARGET_FILL = 0.45;
+    const TARGET_PARTICLES = Math.floor(TARGET_FILL * tankCapacity);
+    const maxParticles = Math.ceil(TARGET_PARTICLES * 2.5);
 
     // create fluid
     const f = new FlipFluid(density, tankWidth, tankHeight, h, r, gapSim, maxParticles);
@@ -812,9 +817,10 @@ export function createFluidPool(
     const initialParticles = numX * numY;
     f.numParticles = initialParticles;
     let spawnIndex = initialParticles;
-    const kLayer = numX;                      // particles in one bottom row
-    const MICRO_BATCH_FRAMES = 6;             // spread one layer removal over N frames
+    const SPREAD_FRAMES = 30;                 // spread excess removal over ~0.5s
+    const NUM_BINS = 16;                      // x-axis bins for distributed removal
     let pendingRemoval = 0;                   // total particles still queued for removal
+    let removalBatchSize = 1;                 // particles removed per frame during cleanup
     let p = 0;
     const jitter = 0.2 * r;
     for (let i = 0; i < numX; i++) {
@@ -985,7 +991,7 @@ export function createFluidPool(
         const y = viewBottom + ((canvas.clientHeight - my) / canvas.clientHeight) * viewHeight;
 
         // Drop a cluster of particles, throttled when near capacity
-        const baseDropCount = 540;
+        const baseDropCount = 250;
         let dropCount = baseDropCount;
         if (f.numParticles / f.maxParticles > SPAWN_THROTTLE_THRESHOLD) {
             dropCount = Math.floor(baseDropCount * SPAWN_THROTTLE_FACTOR);
@@ -1015,29 +1021,54 @@ export function createFluidPool(
             f.particleVel[2 * idx + 1] = -1.0 - Math.random() * 2.0;
         }
 
-        // Queue exactly one bottom layer for micro-batch removal
-        pendingRemoval += kLayer;
+        // Queue excess particles for distributed removal
+        const excess = Math.max(0, f.numParticles - TARGET_PARTICLES);
+        if (excess > pendingRemoval) {
+            pendingRemoval = excess;
+            removalBatchSize = Math.max(1, Math.ceil(excess / SPREAD_FRAMES));
+        }
     }
 
-    // Remove `count` bottom-most particles via swap-remove.
-    function removeBottomParticles(count: number) {
+    // Remove `count` bottom-most particles distributed across x-bins via swap-remove.
+    function removeBottomDistributed(count: number) {
         if (count <= 0 || f.numParticles <= 0) return;
-        const n = Math.min(count, f.numParticles);
 
-        // Find the n lowest-y particle indices
-        const indexed: number[] = [];
+        const tankL = f.h;
+        const tankR = (f.fNumX - 1) * f.h;
+        const binW = (tankR - tankL) / NUM_BINS;
+
+        // Assign particles to x-bins
+        const bins: number[][] = [];
+        for (let b = 0; b < NUM_BINS; b++) bins.push([]);
         for (let i = 0; i < f.numParticles; i++) {
-            indexed.push(i);
+            const b = clamp(Math.floor((f.particlePos[2 * i] - tankL) / binW), 0, NUM_BINS - 1);
+            bins[b].push(i);
         }
-        indexed.sort((a, b) => f.particlePos[2 * a + 1] - f.particlePos[2 * b + 1]);
 
-        const toRemove = indexed.slice(0, n);
-        toRemove.sort((a, b) => b - a); // descending for safe swap-remove
+        // Sort each bin by y ascending (bottom-most first)
+        for (const bin of bins) {
+            bin.sort((a, b) => f.particlePos[2 * a + 1] - f.particlePos[2 * b + 1]);
+        }
 
-        for (const idx of toRemove) {
-            if (idx < f.numParticles) {
-                f.swapRemoveParticle(idx);
+        // Round-robin across bins: take one bottom particle per bin per cycle
+        const toRemove: number[] = [];
+        const ptr = new Array(NUM_BINS).fill(0);
+        while (toRemove.length < count) {
+            let addedThisCycle = false;
+            for (let b = 0; b < NUM_BINS && toRemove.length < count; b++) {
+                if (ptr[b] < bins[b].length) {
+                    toRemove.push(bins[b][ptr[b]]);
+                    ptr[b]++;
+                    addedThisCycle = true;
+                }
             }
+            if (!addedThisCycle) break;
+        }
+
+        // Swap-remove in descending index order (required for correctness)
+        toRemove.sort((a, b) => b - a);
+        for (const idx of toRemove) {
+            if (idx < f.numParticles) f.swapRemoveParticle(idx);
         }
     }
 
@@ -1100,10 +1131,10 @@ export function createFluidPool(
 
                 scene.frameNr++;
 
-                // Micro-batch bottom-layer removal (only active after a click-spawn)
+                // Distributed bottom removal (only active after a click-spawn)
                 if (pendingRemoval > 0) {
-                    const batch = Math.min(pendingRemoval, Math.ceil(kLayer / MICRO_BATCH_FRAMES));
-                    removeBottomParticles(batch);
+                    const batch = Math.min(pendingRemoval, removalBatchSize);
+                    removeBottomDistributed(batch);
                     pendingRemoval -= batch;
                 }
 
