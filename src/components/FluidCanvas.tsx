@@ -23,7 +23,7 @@ export default function FluidCanvas() {
     useEffect(() => { apiRef.current?.setPaused(paused); }, [paused]);
 
     return (
-        <div className="relative w-full h-full">
+        <div className="relative w-full h-full ">
             {/* 2× interaction wrapper — extends beyond canvas for pointer capture */}
             <div
                 ref={wrapperRef}
@@ -32,7 +32,7 @@ export default function FluidCanvas() {
             />
 
             {/* simulation canvas */}
-            <canvas ref={canvasRef} className="absolute inset-0 w-full h-full" />
+            <canvas ref={canvasRef} className="absolute top-0 left-0 block w-full h-full" />
         </div>
     );
 }

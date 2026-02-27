@@ -2,7 +2,7 @@ import Hero from './components/Hero';
 
 function App() {
   return (
-    <main>
+    <main className="w-full h-full">
       <Hero />
     </main>
   );

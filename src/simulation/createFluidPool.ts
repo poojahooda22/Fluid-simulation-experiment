@@ -11,15 +11,15 @@ precision highp float;
 in vec2 a_pos;
 in vec3 a_color;
 uniform vec2 u_res;
+uniform vec2 u_offset;
 uniform float u_ptSz;
 out vec3 v_col;
 
 void main(){
-  // u_res.x is simWidth, u_res.y is simHeight (e.g. 3.0)
-  // map from [0, simWidth] to [-1, 1], and [0, simHeight] to [1, -1]
+  vec2 pos = a_pos - u_offset;
   vec2 screenTransform = vec2(2.0 / u_res.x, 2.0 / u_res.y);
-  gl_Position = vec4(a_pos * screenTransform - vec2(1.0, 1.0), 0.0, 1.0);
-  
+  gl_Position = vec4(pos * screenTransform - vec2(1.0, 1.0), 0.0, 1.0);
+
   gl_PointSize = u_ptSz;
   v_col = a_color;
 }`;
@@ -35,13 +35,12 @@ void main(){
   float ry = 0.5 - gl_PointCoord.y;
   float r2 = rx * rx + ry * ry;
   if(r2 > 0.25) discard;
-  
+
   float dist = sqrt(r2);
   vec3 col = v_col;
-  // White border on the outer 20% of the particle radius
-  
-  
-  o = vec4(col, 1.0);
+  float edgeFade = 1.0 - smoothstep(0.4, 0.5, dist);
+
+  o = vec4(col, edgeFade);
 }`;
 
 // Mesh Shaders for Obstacle Disk
@@ -49,13 +48,14 @@ const MESH_VERT = `#version 300 es
 precision highp float;
 in vec2 a_pos;
 uniform vec2 u_res;
+uniform vec2 u_offset;
 uniform vec3 u_color;
 uniform vec2 u_translation;
 uniform float u_scale;
 out vec3 v_col;
 
 void main(){
-  vec2 v = u_translation + a_pos * u_scale;
+  vec2 v = u_translation + a_pos * u_scale - u_offset;
   vec2 screenTransform = vec2(2.0 / u_res.x, 2.0 / u_res.y);
   gl_Position = vec4(v * screenTransform - vec2(1.0, 1.0), 0.0, 1.0);
   v_col = u_color;
@@ -74,6 +74,10 @@ const FLUID_CELL = 0;
 const AIR_CELL = 1;
 const SOLID_CELL = 2;
 const OBSTACLE_REPULSION = 5.0; // outward push strength, tunable 1.0–5.0
+
+// ═══ Particle Cleanup Tuning ═════════════════════════════════════
+const SPAWN_THROTTLE_THRESHOLD = 0.90; // fraction of maxParticles before throttling
+const SPAWN_THROTTLE_FACTOR = 0.3;    // fraction of dropCount allowed when throttled
 
 export interface PoolOptions {
     particleRadius?: number;
@@ -129,6 +133,7 @@ class FlipFluid {
     particleRestDensity: number;
 
     particleRadius: number;
+    particleGap: number;
     pInvSpacing: number;
     pNumX: number;
     pNumY: number;
@@ -140,7 +145,7 @@ class FlipFluid {
 
     numParticles: number;
 
-    constructor(density: number, width: number, height: number, spacing: number, particleRadius: number, maxParticles: number) {
+    constructor(density: number, width: number, height: number, spacing: number, particleRadius: number, particleGap: number, maxParticles: number) {
         // fluid
         this.density = density;
         this.fNumX = Math.floor(width / spacing) + 1;
@@ -173,7 +178,8 @@ class FlipFluid {
         this.particleRestDensity = 0.0;
 
         this.particleRadius = particleRadius;
-        this.pInvSpacing = 1.0 / (2.2 * particleRadius);
+        this.particleGap = particleGap;
+        this.pInvSpacing = 1.0 / (2.2 * particleRadius + particleGap);
         this.pNumX = Math.floor(width * this.pInvSpacing) + 1;
         this.pNumY = Math.floor(height * this.pInvSpacing) + 1;
         this.pNumCells = this.pNumX * this.pNumY;
@@ -195,44 +201,50 @@ class FlipFluid {
 
     pushParticlesApart(numIters: number) {
         const colorDiffusionCoeff = 0.001;
-
-        this.numCellParticles.fill(0);
-
-        for (let i = 0; i < this.numParticles; i++) {
-            const x = this.particlePos[2 * i];
-            const y = this.particlePos[2 * i + 1];
-
-            const xi = clamp(Math.floor(x * this.pInvSpacing), 0, this.pNumX - 1);
-            const yi = clamp(Math.floor(y * this.pInvSpacing), 0, this.pNumY - 1);
-            const cellNr = xi * this.pNumY + yi;
-            this.numCellParticles[cellNr]++;
-        }
-
-        let first = 0;
-        for (let i = 0; i < this.pNumCells; i++) {
-            first += this.numCellParticles[i];
-            this.firstCellParticle[i] = first;
-        }
-        this.firstCellParticle[this.pNumCells] = first;
-
-        for (let i = 0; i < this.numParticles; i++) {
-            const x = this.particlePos[2 * i];
-            const y = this.particlePos[2 * i + 1];
-            const xi = clamp(Math.floor(x * this.pInvSpacing), 0, this.pNumX - 1);
-            const yi = clamp(Math.floor(y * this.pInvSpacing), 0, this.pNumY - 1);
-            const cellNr = xi * this.pNumY + yi;
-            this.firstCellParticle[cellNr]--;
-            this.cellParticleIds[this.firstCellParticle[cellNr]] = i;
-        }
-
-        // Enforce a "safe space" between particles to prevent jamming and high velocity collisions
-        const minDist = 2.2 * this.particleRadius;
+        const minDist = 2.0 * this.particleRadius + this.particleGap;
         const minDist2 = minDist * minDist;
 
+        // Wall-particle separation: same spacing rule as between particles.
+        // Wall surface sits at one cell width from domain edge (solid cell boundary).
+        // halfDist = minDist/2: the clearance a particle center must keep from the wall,
+        // identical to the half-correction each particle gets in pair separation.
+        const wh = 1.0 / this.fInvSpacing;
+        const halfDist = minDist * 0.5;
+        const leftWall = wh;
+        const rightWall = (this.fNumX - 1) * wh;
+        const bottomWall = wh;
+
         for (let iter = 0; iter < numIters; iter++) {
+            // Rebuild spatial hash each iteration so moved particles are found
+            this.numCellParticles.fill(0);
             for (let i = 0; i < this.numParticles; i++) {
-                let px = this.particlePos[2 * i];
-                let py = this.particlePos[2 * i + 1];
+                const x = this.particlePos[2 * i];
+                const y = this.particlePos[2 * i + 1];
+                const xi = clamp(Math.floor(x * this.pInvSpacing), 0, this.pNumX - 1);
+                const yi = clamp(Math.floor(y * this.pInvSpacing), 0, this.pNumY - 1);
+                const cellNr = xi * this.pNumY + yi;
+                this.numCellParticles[cellNr]++;
+            }
+            let first = 0;
+            for (let i = 0; i < this.pNumCells; i++) {
+                first += this.numCellParticles[i];
+                this.firstCellParticle[i] = first;
+            }
+            this.firstCellParticle[this.pNumCells] = first;
+            for (let i = 0; i < this.numParticles; i++) {
+                const x = this.particlePos[2 * i];
+                const y = this.particlePos[2 * i + 1];
+                const xi = clamp(Math.floor(x * this.pInvSpacing), 0, this.pNumX - 1);
+                const yi = clamp(Math.floor(y * this.pInvSpacing), 0, this.pNumY - 1);
+                const cellNr = xi * this.pNumY + yi;
+                this.firstCellParticle[cellNr]--;
+                this.cellParticleIds[this.firstCellParticle[cellNr]] = i;
+            }
+
+            // Separation pass
+            for (let i = 0; i < this.numParticles; i++) {
+                const px = this.particlePos[2 * i];
+                const py = this.particlePos[2 * i + 1];
 
                 const pxi = Math.floor(px * this.pInvSpacing);
                 const pyi = Math.floor(py * this.pInvSpacing);
@@ -244,16 +256,14 @@ class FlipFluid {
                 for (let xi = x0; xi <= x1; xi++) {
                     for (let yi = y0; yi <= y1; yi++) {
                         const cellNr = xi * this.pNumY + yi;
-                        const first = this.firstCellParticle[cellNr];
-                        const last = this.firstCellParticle[cellNr + 1];
-                        for (let j = first; j < last; j++) {
+                        const cfirst = this.firstCellParticle[cellNr];
+                        const clast = this.firstCellParticle[cellNr + 1];
+                        for (let j = cfirst; j < clast; j++) {
                             const id = this.cellParticleIds[j];
                             if (id === i) continue;
-                            let qx = this.particlePos[2 * id];
-                            let qy = this.particlePos[2 * id + 1];
 
-                            let dx = qx - px;
-                            let dy = qy - py;
+                            let dx = this.particlePos[2 * id] - px;
+                            let dy = this.particlePos[2 * id + 1] - py;
                             const d2 = dx * dx + dy * dy;
                             if (d2 > minDist2 || d2 === 0.0) continue;
                             const d = Math.sqrt(d2);
@@ -276,20 +286,27 @@ class FlipFluid {
                     }
                 }
             }
-        }
 
-        // Clamp particles back into valid domain after separation
-        const h = 1.0 / this.fInvSpacing;
-        const r = this.particleRadius;
-        const bMinX = h + r;
-        const bMaxX = (this.fNumX - 1) * h - r;
-        const bMinY = h + r;
-        const bMaxY = (this.fNumY - 1) * h - r;
-        for (let i = 0; i < this.numParticles; i++) {
-            if (this.particlePos[2 * i] < bMinX) this.particlePos[2 * i] = bMinX;
-            if (this.particlePos[2 * i] > bMaxX) this.particlePos[2 * i] = bMaxX;
-            if (this.particlePos[2 * i + 1] < bMinY) this.particlePos[2 * i + 1] = bMinY;
-            if (this.particlePos[2 * i + 1] > bMaxY) this.particlePos[2 * i + 1] = bMaxY;
+            // Wall-particle separation: push particles away from walls
+            // using the same spacing rule as particle-particle pairs.
+            // Wall is immovable so particle gets 100% of the correction.
+            for (let i = 0; i < this.numParticles; i++) {
+                // Bottom wall
+                const distBot = this.particlePos[2 * i + 1] - bottomWall;
+                if (distBot > 0 && distBot < halfDist) {
+                    this.particlePos[2 * i + 1] += halfDist - distBot;
+                }
+                // Left wall
+                const distLeft = this.particlePos[2 * i] - leftWall;
+                if (distLeft > 0 && distLeft < halfDist) {
+                    this.particlePos[2 * i] += halfDist - distLeft;
+                }
+                // Right wall
+                const distRight = rightWall - this.particlePos[2 * i];
+                if (distRight > 0 && distRight < halfDist) {
+                    this.particlePos[2 * i] -= halfDist - distRight;
+                }
+            }
         }
     }
 
@@ -299,10 +316,11 @@ class FlipFluid {
         const minDist = obstacleRadius + r;
         const minDist2 = minDist * minDist;
 
-        const minX = h + r;
-        const maxX = (this.fNumX - 1) * h - r;
-        const minY = h + r;
-        const maxY = (this.fNumY - 1) * h - r;
+        const wallPad = r + this.particleGap * 0.5;
+        const minX = h + wallPad;
+        const maxX = (this.fNumX - 1) * h - wallPad;
+        const minY = h + wallPad;
+        const maxY = (this.fNumY - 1) * h - wallPad;
 
         for (let i = 0; i < this.numParticles; i++) {
             let x = this.particlePos[2 * i];
@@ -354,19 +372,19 @@ class FlipFluid {
 
             if (x < minX) {
                 x = minX;
-                this.particleVel[2 * i] = 0.0;
+                this.particleVel[2 * i] *= -0.02;
             }
             if (x > maxX) {
                 x = maxX;
-                this.particleVel[2 * i] = 0.0;
+                this.particleVel[2 * i] *= -0.02;
             }
             if (y < minY) {
                 y = minY;
-                this.particleVel[2 * i + 1] = 0.0;
+                this.particleVel[2 * i + 1] *= -0.02;
             }
             if (y > maxY) {
                 y = maxY;
-                this.particleVel[2 * i + 1] = 0.0;
+                this.particleVel[2 * i + 1] *= -0.02;
             }
             this.particlePos[2 * i] = x;
             this.particlePos[2 * i + 1] = y;
@@ -643,6 +661,30 @@ class FlipFluid {
         }
     }
 
+    applyIdleWave(simTime: number, dt: number, strength: number, frequency: number, noise: number) {
+        for (let i = 0; i < this.numParticles; i++) {
+            const x = this.particlePos[2 * i];
+            const y = this.particlePos[2 * i + 1];
+
+            // Phase varies with position for natural wave appearance
+            const phase = frequency * simTime + 2.5 * y - 0.3 * x;
+
+            // Horizontal wave (primary) applied as acceleration
+            const waveX = strength * Math.sin(phase);
+            // Subtle vertical response (secondary, phase-shifted)
+            const waveY = strength * 0.2 * Math.cos(phase * 1.3 + 0.7);
+
+            this.particleVel[2 * i] += waveX * dt;
+            this.particleVel[2 * i + 1] += waveY * dt;
+
+            // Tiny noise to break uniformity
+            if (noise > 0) {
+                this.particleVel[2 * i] += (Math.random() - 0.5) * noise * dt;
+                this.particleVel[2 * i + 1] += (Math.random() - 0.5) * noise * dt * 0.3;
+            }
+        }
+    }
+
     updateParticleColors() {
         // Keep particles simple blue
         for (let i = 0; i < this.numParticles; i++) {
@@ -652,19 +694,34 @@ class FlipFluid {
         }
     }
 
+    swapRemoveParticle(i: number) {
+        const last = this.numParticles - 1;
+        if (i < last) {
+            this.particlePos[2 * i]     = this.particlePos[2 * last];
+            this.particlePos[2 * i + 1] = this.particlePos[2 * last + 1];
+            this.particleVel[2 * i]     = this.particleVel[2 * last];
+            this.particleVel[2 * i + 1] = this.particleVel[2 * last + 1];
+            this.particleColor[3 * i]     = this.particleColor[3 * last];
+            this.particleColor[3 * i + 1] = this.particleColor[3 * last + 1];
+            this.particleColor[3 * i + 2] = this.particleColor[3 * last + 2];
+        }
+        this.numParticles--;
+    }
+
     simulate(dt: number, gravity: number, flipRatio: number, numPressureIters: number, numParticleIters: number, overRelaxation: number, compensateDrift: boolean, separateParticles: boolean, obstacleX: number, obstacleY: number, obstacleRadius: number, obstacleVelX: number, obstacleVelY: number) {
         const numSubSteps = 1;
         const sdt = dt / numSubSteps;
 
         for (let step = 0; step < numSubSteps; step++) {
             this.integrateParticles(sdt, gravity);
-            this.handleParticleCollisions(obstacleX, obstacleY, obstacleRadius, obstacleVelX, obstacleVelY);
             if (separateParticles)
                 this.pushParticlesApart(numParticleIters);
+            this.handleParticleCollisions(obstacleX, obstacleY, obstacleRadius, obstacleVelX, obstacleVelY);
             this.transferVelocities(true, flipRatio);
             this.updateParticleDensity();
             this.solveIncompressibility(numPressureIters, sdt, overRelaxation, compensateDrift);
             this.transferVelocities(false, flipRatio);
+            this.dampVelocities(0.005);
             this.clampVelocities(10.0);
         }
 
@@ -694,61 +751,78 @@ export function createFluidPool(
     const scene = {
         gravity: opts?.gravity !== undefined ? opts.gravity : -9.81,
         dt: opts?.dt ?? 1.0 / 60.0,
-        flipRatio: opts?.flipRatio ?? 0.8,
+        flipRatio: opts?.flipRatio ?? 0.65,
         numPressureIters: opts?.pressureIters ?? 80,
-        numParticleIters: opts?.sepIters ?? 2,
-        overRelaxation: opts?.overRelax ?? 1.9,
+        numParticleIters: opts?.sepIters ?? 3,
+        overRelaxation: opts?.overRelax ?? 1.8,
         compensateDrift: true,
         separateParticles: true,
         obstacleX: 0.0,
         obstacleY: 0.0,
-        obstacleRadius: 0.15,
+        obstacleRadius: 0.25,
         obstacleVelX: 0.0,
         obstacleVelY: 0.0,
         paused: false,
         frameNr: 0,
         showDebug: false,
+        simTime: 0.0,
+        idleWaveEnabled: true,
+        idleWaveStrength: 0.07,
+        idleWaveFrequency: 1.7,
+        idleWaveNoise: 0.04,
     };
 
     const simHeight = 3.0;
     const cScale = (canvas.clientHeight || window.innerHeight) / simHeight;
     const simWidth = (canvas.clientWidth || window.innerWidth) / cScale;
-    const res = 70; // Decrease resolution to enlarge tracking grid + physical particles safely
+    // Particle size is controlled via res: lower res → bigger h → bigger r.
+    // r/h = 0.3 (reference ratio) keeps FLIP grid coupling stable.
+    const TARGET_RADIUS_PX = 7;  // desired rendered particle radius in CSS px
+    const GAP_PX = 8;            // desired visible gap between particle edges
+    const res = Math.round(0.3 * (canvas.clientHeight || window.innerHeight) / TARGET_RADIUS_PX);
 
     const tankHeight = 1.0 * simHeight;
     const tankWidth = 1.0 * simWidth;
     const h = tankHeight / res;
     const density = 1000.0;
 
-    // decrease starting volume
-    const relWaterHeight = 0.50;
-    const relWaterWidth = 0.40;
+    // initial fill: spawn across full width, ~35-40% height
+    const relWaterHeight = 0.60;
+    const relWaterWidth = 0.70;
 
-    // compute number of particles
-    const r = 0.4 * h; // Revert to stable FLIP ratio so physics don't explode
-    const spawnSpacing = 2.2 * r; // Adds a safe space physical gap between particles
-    const dx = spawnSpacing;
+    const gapSim = GAP_PX / cScale;
+
+    // compute number of particles — r/h = 0.3 matches reference for stable FLIP
+    const r = 0.3 * h;
+    const minDistSpawn = 2.0 * r + gapSim;
+    const dx = minDistSpawn;
     const dy = Math.sqrt(3.0) / 2.0 * dx;
 
-    // Use Math.round to preserve the exact field area when particles are larger
-    const numX = Math.round((relWaterWidth * tankWidth - 2.0 * h - 2.0 * r) / dx);
-    const numY = Math.round((relWaterHeight * tankHeight - 2.0 * h - 2.0 * r) / dy);
-    // Allow room to spawn thousands of extra particles by clicking. 
+    const wallPad = r + gapSim * 0.5;
+    const numX = Math.round((relWaterWidth * tankWidth - 2.0 * h - 2.0 * wallPad) / dx);
+    const numY = Math.round((relWaterHeight * tankHeight - 2.0 * h - 2.0 * wallPad) / dy);
+    // Allow room to spawn thousands of extra particles by clicking.
     // Since dropCount is 540, we need a large buffer.
     const maxParticles = numX * numY + 3000;
 
     // create fluid
-    const f = new FlipFluid(density, tankWidth, tankHeight, h, r, maxParticles);
+    const f = new FlipFluid(density, tankWidth, tankHeight, h, r, gapSim, maxParticles);
 
     // create particles
     const initialParticles = numX * numY;
     f.numParticles = initialParticles;
     let spawnIndex = initialParticles;
+    const kLayer = numX;                      // particles in one bottom row
+    const MICRO_BATCH_FRAMES = 6;             // spread one layer removal over N frames
+    let pendingRemoval = 0;                   // total particles still queued for removal
     let p = 0;
+    const jitter = 0.2 * r;
     for (let i = 0; i < numX; i++) {
         for (let j = 0; j < numY; j++) {
-            f.particlePos[p++] = h + r + dx * i + (j % 2 === 0 ? 0.0 : 0.5 * dx);
-            f.particlePos[p++] = h + r + dy * j;
+            f.particlePos[p++] = h + wallPad + dx * i + (j % 2 === 0 ? 0.0 : 0.5 * dx)
+                + (Math.random() - 0.5) * jitter;
+            f.particlePos[p++] = h + wallPad + dy * j
+                + (Math.random() - 0.5) * jitter;
         }
     }
 
@@ -762,6 +836,13 @@ export function createFluidPool(
             f.s[i * n + j] = s;
         }
     }
+
+    // ── View bounds: fluid region only (walls pushed off-screen) ──
+    const viewLeft = f.h;
+    const viewBottom = f.h;
+    const viewRight = (f.fNumX - 1) * f.h;
+    const viewWidth = viewRight - viewLeft;
+    const viewHeight = simHeight - viewBottom;
 
     // ── WebGL2 Rendering Setup ──
     const gl = canvas.getContext('webgl2', { alpha: true, premultipliedAlpha: false });
@@ -777,6 +858,7 @@ export function createFluidPool(
     gl.linkProgram(prog);
 
     const uRes = gl.getUniformLocation(prog, 'u_res')!;
+    const uOff = gl.getUniformLocation(prog, 'u_offset')!;
     const uPt = gl.getUniformLocation(prog, 'u_ptSz')!;
     const vao = gl.createVertexArray()!;
     gl.bindVertexArray(vao);
@@ -804,6 +886,7 @@ export function createFluidPool(
     gl.linkProgram(m_prog);
 
     const m_uRes = gl.getUniformLocation(m_prog, 'u_res')!;
+    const m_uOff = gl.getUniformLocation(m_prog, 'u_offset')!;
     const m_uCol = gl.getUniformLocation(m_prog, 'u_color')!;
     const m_uTrans = gl.getUniformLocation(m_prog, 'u_translation')!;
     const m_uScale = gl.getUniformLocation(m_prog, 'u_scale')!;
@@ -898,18 +981,22 @@ export function createFluidPool(
         const mx = cx - rc.left;
         const my = cy - rc.top;
 
-        const x = mx / cScale;
-        const y = (canvas.clientHeight - my) / cScale; // y-axis up
+        const x = viewLeft + (mx / canvas.clientWidth) * viewWidth;
+        const y = viewBottom + ((canvas.clientHeight - my) / canvas.clientHeight) * viewHeight;
 
-        // Drop a cluster of particles
-        const dropCount = 540;
+        // Drop a cluster of particles, throttled when near capacity
+        const baseDropCount = 540;
+        let dropCount = baseDropCount;
+        if (f.numParticles / f.maxParticles > SPAWN_THROTTLE_THRESHOLD) {
+            dropCount = Math.floor(baseDropCount * SPAWN_THROTTLE_FACTOR);
+        }
 
         for (let i = 0; i < dropCount; i++) {
             let idx = f.numParticles;
             if (f.numParticles >= f.maxParticles) {
                 // Recycle oldest spawned particle (ring buffer from initialParticles to maxParticles)
                 const poolSize = f.maxParticles - initialParticles;
-                if (poolSize <= 0) break; // fallback if no extra buffer 
+                if (poolSize <= 0) break; // fallback if no extra buffer
                 idx = initialParticles + ((spawnIndex - initialParticles) % poolSize);
             } else {
                 f.numParticles++;
@@ -927,15 +1014,39 @@ export function createFluidPool(
             f.particleVel[2 * idx] = (Math.random() - 0.5) * 1.0;
             f.particleVel[2 * idx + 1] = -1.0 - Math.random() * 2.0;
         }
+
+        // Queue exactly one bottom layer for micro-batch removal
+        pendingRemoval += kLayer;
     }
 
+    // Remove `count` bottom-most particles via swap-remove.
+    function removeBottomParticles(count: number) {
+        if (count <= 0 || f.numParticles <= 0) return;
+        const n = Math.min(count, f.numParticles);
+
+        // Find the n lowest-y particle indices
+        const indexed: number[] = [];
+        for (let i = 0; i < f.numParticles; i++) {
+            indexed.push(i);
+        }
+        indexed.sort((a, b) => f.particlePos[2 * a + 1] - f.particlePos[2 * b + 1]);
+
+        const toRemove = indexed.slice(0, n);
+        toRemove.sort((a, b) => b - a); // descending for safe swap-remove
+
+        for (const idx of toRemove) {
+            if (idx < f.numParticles) {
+                f.swapRemoveParticle(idx);
+            }
+        }
+    }
 
     function handlePointerMove(cx: number, cy: number) {
         const rc = canvas.getBoundingClientRect();
         const mx = cx - rc.left;
         const my = cy - rc.top;
-        const x = mx / cScale;
-        const y = (canvas.clientHeight - my) / cScale;
+        const x = viewLeft + (mx / canvas.clientWidth) * viewWidth;
+        const y = viewBottom + ((canvas.clientHeight - my) / canvas.clientHeight) * viewHeight;
         setObstacle(x, y, false);
     }
 
@@ -979,7 +1090,22 @@ export function createFluidPool(
                     scene.overRelaxation, scene.compensateDrift, scene.separateParticles,
                     scene.obstacleX, scene.obstacleY, scene.obstacleRadius, scene.obstacleVelX, scene.obstacleVelY
                 );
+
+                // Apply idle wave for gentle resting motion (after simulate so pressure solver doesn't cancel it)
+                if (scene.idleWaveEnabled) {
+                    f.applyIdleWave(scene.simTime, scene.dt,
+                        scene.idleWaveStrength, scene.idleWaveFrequency, scene.idleWaveNoise);
+                }
+                scene.simTime += scene.dt;
+
                 scene.frameNr++;
+
+                // Micro-batch bottom-layer removal (only active after a click-spawn)
+                if (pendingRemoval > 0) {
+                    const batch = Math.min(pendingRemoval, Math.ceil(kLayer / MICRO_BATCH_FRAMES));
+                    removeBottomParticles(batch);
+                    pendingRemoval -= batch;
+                }
 
                 // Debug: highlight particles near obstacle
                 if (scene.showDebug && scene.obstacleX > -5.0) {
@@ -1016,14 +1142,28 @@ export function createFluidPool(
             gl!.enable(gl!.BLEND);
             gl!.blendFunc(gl!.SRC_ALPHA, gl!.ONE_MINUS_SRC_ALPHA);
 
-            if (scene.frameNr % 60 === 0) {
-                console.log(`Frame ${scene.frameNr}: P0[${f.particlePos[0].toFixed(2)}, ${f.particlePos[1].toFixed(2)}] NumP: ${f.numParticles} simW: ${simWidth.toFixed(2)}`);
+            if (scene.frameNr % 120 === 0) {
+                let moving = 0;
+                const eps2 = 0.01 * 0.01;
+                const speeds: number[] = [];
+                for (let i = 0; i < f.numParticles; i++) {
+                    const vx = f.particleVel[2 * i];
+                    const vy = f.particleVel[2 * i + 1];
+                    const s2 = vx * vx + vy * vy;
+                    if (s2 > eps2) moving++;
+                    speeds.push(Math.sqrt(s2));
+                }
+                speeds.sort((a, b) => a - b);
+                const pct = (100 * moving / f.numParticles).toFixed(1);
+                const median = speeds[Math.floor(speeds.length / 2)]?.toFixed(4) ?? '0';
+                console.log(`[wave-debug] F${scene.frameNr}: ${pct}% moving, median speed: ${median}, N=${f.numParticles}`);
             }
 
-            const ptSz = 2.0 * f.particleRadius / simWidth * cvs.width;
+            const ptSz = 2.0 * f.particleRadius / viewWidth * cvs.width;
 
             gl!.useProgram(prog);
-            gl!.uniform2f(uRes, simWidth, simHeight);
+            gl!.uniform2f(uRes, viewWidth, viewHeight);
+            gl!.uniform2f(uOff, viewLeft, viewBottom);
             gl!.uniform1f(uPt, ptSz);
 
             gl!.bindVertexArray(vao);
@@ -1038,7 +1178,8 @@ export function createFluidPool(
             // Draw obstacle disk (debug only)
             if (scene.showDebug && scene.obstacleX > -5.0) {
                 gl!.useProgram(m_prog);
-                gl!.uniform2f(m_uRes, simWidth, simHeight);
+                gl!.uniform2f(m_uRes, viewWidth, viewHeight);
+                gl!.uniform2f(m_uOff, viewLeft, viewBottom);
                 gl!.uniform3f(m_uCol, 1.0, 0.0, 0.0);
                 gl!.uniform2f(m_uTrans, scene.obstacleX, scene.obstacleY);
                 gl!.uniform1f(m_uScale, scene.obstacleRadius + f.particleRadius);
