@@ -993,6 +993,7 @@ export function createFluidPool(
     const simHeight = 3.0;
     const MAX_DPR = 2.0;
     const dpr = Math.min(window.devicePixelRatio || 1, MAX_DPR);
+    const BOTTOM_FUDGE_PX = 10;
 
     /** Authoritative viewport dimensions — uses visualViewport on mobile */
     function getViewportSize() {
@@ -1090,11 +1091,12 @@ export function createFluidPool(
     /** Imperatively size canvas to fill viewport. Returns true if size changed. */
     function resizeCanvas(): boolean {
         const { w, h } = getViewportSize();
+        const hExt = h + BOTTOM_FUDGE_PX;
         canvas.style.width  = w + 'px';
-        canvas.style.height = h + 'px';
+        canvas.style.height = hExt + 'px';
 
         const bufW = Math.round(w * dpr);
-        const bufH = Math.round(h * dpr);
+        const bufH = Math.round(hExt * dpr);
         if (canvas.width === bufW && canvas.height === bufH) return false;
 
         canvas.width  = bufW;
@@ -1103,7 +1105,7 @@ export function createFluidPool(
         const gridViewW = (f.fNumX - 1) * f.h - f.h;
         const physPerPx = gridViewW / w;
         viewWidth  = gridViewW;
-        viewHeight = h * physPerPx;
+        viewHeight = hExt * physPerPx;
         viewLeft   = f.h;
         viewBottom = Math.min(f.h, viewableTop - viewHeight);
         return true;

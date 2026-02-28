@@ -28,7 +28,7 @@ export default function FluidCanvas({ onApiReady }: FluidCanvasProps) {
     useEffect(() => { apiRef.current?.setPaused(paused); }, [paused]);
 
     return (
-        <div className="relative w-full h-full overflow-hidden">
+        <div className="relative w-full h-full overflow-visible">
             {/* 2× interaction wrapper — extends beyond canvas for pointer capture */}
             <div
                 ref={wrapperRef}
