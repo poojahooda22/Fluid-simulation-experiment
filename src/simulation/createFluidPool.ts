@@ -993,13 +993,21 @@ export function createFluidPool(
     const simHeight = 3.0;
     const MAX_DPR = 2.0;
     const dpr = Math.min(window.devicePixelRatio || 1, MAX_DPR);
-    const cScale = (canvas.clientHeight || window.innerHeight) / simHeight;
-    const simWidth = (canvas.clientWidth || window.innerWidth) / cScale;
+
+    /** Authoritative viewport dimensions — uses visualViewport on mobile */
+    function getViewportSize() {
+        const vv = window.visualViewport;
+        return { w: vv?.width ?? window.innerWidth, h: vv?.height ?? window.innerHeight };
+    }
+
+    const { w: initW, h: initH } = getViewportSize();
+    const cScale = initH / simHeight;
+    const simWidth = initW / cScale;
     // Particle size is controlled via res: lower res → bigger h → bigger r.
     // r/h = 0.3 (reference ratio) keeps FLIP grid coupling stable.
     const TARGET_RADIUS_PX = 7;  // desired rendered particle radius in CSS px
     const GAP_PX = 4;            // desired visible gap between particle edges
-    const res = Math.round(0.3 * (canvas.clientHeight || window.innerHeight) / TARGET_RADIUS_PX);
+    const res = Math.round(0.3 * initH / TARGET_RADIUS_PX);
 
     const tankHeight = 1.0 * simHeight;
     const tankWidth = 1.0 * simWidth;
@@ -1078,6 +1086,30 @@ export function createFluidPool(
     const viewRight = (f.fNumX - 1) * f.h;
     let viewWidth = viewRight - viewLeft;
     let viewHeight = viewableSimHeight;
+
+    /** Imperatively size canvas to fill viewport. Returns true if size changed. */
+    function resizeCanvas(): boolean {
+        const { w, h } = getViewportSize();
+        canvas.style.width  = w + 'px';
+        canvas.style.height = h + 'px';
+
+        const bufW = Math.round(w * dpr);
+        const bufH = Math.round(h * dpr);
+        if (canvas.width === bufW && canvas.height === bufH) return false;
+
+        canvas.width  = bufW;
+        canvas.height = bufH;
+
+        const gridViewW = (f.fNumX - 1) * f.h - f.h;
+        const physPerPx = gridViewW / w;
+        viewWidth  = gridViewW;
+        viewHeight = h * physPerPx;
+        viewLeft   = f.h;
+        viewBottom = Math.min(f.h, viewableTop - viewHeight);
+        return true;
+    }
+
+    resizeCanvas(); // size canvas before first frame
 
     console.log(`[FluidPool] init: ${f.numParticles} particles, grid ${f.fNumX}x${f.fNumY}, h=${f.h.toFixed(4)}, r=${r.toFixed(4)}, viewW=${viewWidth.toFixed(3)}, viewH=${viewHeight.toFixed(3)}, canvas=${canvas.clientWidth}x${canvas.clientHeight}`);
 
@@ -1442,6 +1474,19 @@ export function createFluidPool(
         }) as EventListener, false);
     }
 
+    // ── Viewport resize handling ──
+    let resizeRafId = 0;
+    function scheduleResize() {
+        if (resizeRafId) return;
+        resizeRafId = requestAnimationFrame(() => { resizeRafId = 0; resizeCanvas(); });
+    }
+    listen(window as unknown as EventTarget, 'resize', scheduleResize as EventListener);
+    listen(window as unknown as EventTarget, 'orientationchange', scheduleResize as EventListener);
+    if (window.visualViewport) {
+        listen(window.visualViewport as unknown as EventTarget, 'resize', scheduleResize as EventListener);
+        listen(window.visualViewport as unknown as EventTarget, 'scroll', scheduleResize as EventListener);
+    }
+
     // ── Loop ──
     let rafId = 0;
     function loop() {
@@ -1510,21 +1555,10 @@ export function createFluidPool(
                     }
                 }
 
-                // Render
+                // Render — resizeCanvas() is driven by viewport event listeners;
+                // per-frame call is a safety net (early-returns when size unchanged).
+                resizeCanvas();
                 const cvs = gl!.canvas as HTMLCanvasElement;
-                const targetW = Math.round(cvs.clientWidth * dpr);
-                const targetH = Math.round(cvs.clientHeight * dpr);
-                if (cvs.width !== targetW || cvs.height !== targetH) {
-                    cvs.width = targetW;
-                    cvs.height = targetH;
-                    // Derive scale from grid width so particles fill edge-to-edge horizontally
-                    const gridViewW = (f.fNumX - 1) * f.h - f.h;
-                    const physPerPx = gridViewW / cvs.clientWidth;
-                    viewWidth = gridViewW;
-                    viewHeight = cvs.clientHeight * physPerPx;
-                    viewLeft = f.h;
-                    viewBottom = f.h;
-                }
                 gl!.viewport(0, 0, cvs.width, cvs.height);
                 gl!.clearColor(0, 0, 0, 0);
                 gl!.clear(gl!.COLOR_BUFFER_BIT | gl!.DEPTH_BUFFER_BIT);

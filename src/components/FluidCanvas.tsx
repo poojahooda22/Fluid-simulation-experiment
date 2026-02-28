@@ -37,7 +37,7 @@ export default function FluidCanvas({ onApiReady }: FluidCanvasProps) {
             />
 
             {/* simulation canvas */}
-            <canvas ref={canvasRef} className="absolute top-0 left-0 block w-full h-full bg-[#1a2ffb]" />
+            <canvas ref={canvasRef} className="absolute top-0 left-0 block bg-[#1a2ffb]" />
         </div>
     );
 }
