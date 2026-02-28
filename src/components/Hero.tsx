@@ -15,7 +15,7 @@ const Hero = () => {
     }, []);
 
     return (
-        <section className="relative w-full h-full">
+        <section className="fixed inset-0 w-full h-full">
             {/* Fluid simulation background */}
             <FluidCanvas onApiReady={handleApiReady} />
 
