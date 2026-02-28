@@ -33,7 +33,7 @@ export default function FluidCanvas({ onApiReady }: FluidCanvasProps) {
             <div
                 ref={wrapperRef}
                 className="absolute z-10"
-                style={{ width: '200%', height: '200%', top: '-50%', left: '-50%' }}
+                style={{ width: '100%', height: '100%', top: '0%', left: '0%' }}
             />
 
             {/* simulation canvas */}
