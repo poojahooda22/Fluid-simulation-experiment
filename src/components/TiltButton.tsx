@@ -15,9 +15,8 @@ export default function TiltButton({ supported, enabled, permissionDenied, onReq
         <button
             onClick={onRequest}
             disabled={permissionDenied}
-            className="pointer-events-auto bg-white/20 backdrop-blur-sm text-white
-                       px-12 py-2.5 rounded-full text-sm font-light border border-white/30
-                       hover:bg-white/30 transition-colors disabled:opacity-50
+            className="pointer-events-auto backdrop-blur-sm text-black bg-white
+                       px-[2vh] py-[2vh] rounded-full text-sm font-light border border-white/30
                        disabled:cursor-not-allowed"
         >
             {permissionDenied ? 'Tilt Permission Denied' : 'Enable Tilt Controls'}

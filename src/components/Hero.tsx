@@ -20,10 +20,10 @@ const Hero = () => {
             <FluidCanvas onApiReady={handleApiReady} />
 
             {/* UI overlay — above the simulation interaction layer */}
-            <div className="absolute top-10 left-10 right-10 inset-0 z-20 pointer-events-none">
+            <div className="absolute top-4 left-4 right-4 sm:top-10 sm:left-10 sm:right-10 inset-0 z-20 pointer-events-none">
                 <Navbar />
                 <div className="flex flex-col justify-center items-center gap-6 w-full h-full -translate-y-[13vh]">
-                    <p className="text-[0.9rem] sm:text-[1.3rem] font-light">IS YOUR BIG IDEA READY TO GO WILD?</p>
+                    <p className="text-[0.75rem] sm:text-[1rem] font-light">IS YOUR BIG IDEA READY TO GO WILD?</p>
                     <AnimatedHeading />
                     <TiltButton
                         supported={tilt.supported}

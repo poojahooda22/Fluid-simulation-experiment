@@ -1006,8 +1006,11 @@ export function createFluidPool(
     const h = tankHeight / res;
     const density = 1000.0;
 
-    // initial fill: spawn across full width, ~35-40% height
-    const relWaterHeight = 0.50;
+    // Mobile detection (used for fill height + touch listener gating)
+    const isMobile = 'ontouchstart' in window || window.matchMedia('(pointer: coarse)').matches;
+
+    // initial fill: on mobile use taller column so settled pool ≈ 45% height
+    const relWaterHeight = isMobile ? 0.75 : 0.50;
     const relWaterWidth = 0.60;
 
     const gapSim = GAP_PX / cScale;
@@ -1423,7 +1426,6 @@ export function createFluidPool(
 
     // Touch listeners: only on desktop (non-touch) devices.
     // On mobile, tilt is the sole interaction method.
-    const isMobile = 'ontouchstart' in window || window.matchMedia('(pointer: coarse)').matches;
     if (!isMobile) {
         listen(wrapper, 'touchstart', ((e: TouchEvent) => {
             e.preventDefault();
