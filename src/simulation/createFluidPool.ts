@@ -139,6 +139,7 @@ export interface PoolAPI {
     setFlipRatio: (v: number) => void;
     setPaused: (v: boolean) => void;
     setShowDebug: (v: boolean) => void;
+    setTiltForce: (x: number, y: number) => void;
 }
 
 function clamp(x: number, min: number, max: number) {
@@ -252,9 +253,10 @@ class FlipFluid {
         this.numParticles = 0;
     }
 
-    integrateParticles(dt: number, gravity: number) {
+    integrateParticles(dt: number, gravity: number, tiltForceX: number = 0, tiltForceY: number = 0) {
         for (let i = 0; i < this.numParticles; i++) {
-            this.particleVel[2 * i + 1] += dt * gravity;
+            this.particleVel[2 * i] += dt * tiltForceX;
+            this.particleVel[2 * i + 1] += dt * (gravity + tiltForceY);
             this.particlePos[2 * i] += this.particleVel[2 * i] * dt;
             this.particlePos[2 * i + 1] += this.particleVel[2 * i + 1] * dt;
         }
@@ -916,12 +918,12 @@ class FlipFluid {
         this.numParticles--;
     }
 
-    simulate(dt: number, gravity: number, flipRatio: number, numPressureIters: number, numParticleIters: number, overRelaxation: number, compensateDrift: boolean, separateParticles: boolean, obstacleX: number, obstacleY: number, obstacleRadius: number, obstacleVelX: number, obstacleVelY: number) {
+    simulate(dt: number, gravity: number, flipRatio: number, numPressureIters: number, numParticleIters: number, overRelaxation: number, compensateDrift: boolean, separateParticles: boolean, obstacleX: number, obstacleY: number, obstacleRadius: number, obstacleVelX: number, obstacleVelY: number, tiltForceX: number = 0, tiltForceY: number = 0) {
         const numSubSteps = 1;
         const sdt = dt / numSubSteps;
 
         for (let step = 0; step < numSubSteps; step++) {
-            this.integrateParticles(sdt, gravity);
+            this.integrateParticles(sdt, gravity, tiltForceX, tiltForceY);
             if (separateParticles)
                 this.pushParticlesApart(numParticleIters);
             this.handleParticleCollisions(obstacleX, obstacleY, obstacleRadius, obstacleVelX, obstacleVelY);
@@ -984,9 +986,13 @@ export function createFluidPool(
         idleWaveStrength: 0.60,
         idleWaveFrequency: 3.2,
         idleWaveNoise: 0.06,
+        tiltForceX: 0.0,
+        tiltForceY: 0.0,
     };
 
     const simHeight = 3.0;
+    const MAX_DPR = 2.0;
+    const dpr = Math.min(window.devicePixelRatio || 1, MAX_DPR);
     const cScale = (canvas.clientHeight || window.innerHeight) / simHeight;
     const simWidth = (canvas.clientWidth || window.innerWidth) / cScale;
     // Particle size is controlled via res: lower res → bigger h → bigger r.
@@ -1076,7 +1082,7 @@ export function createFluidPool(
     const gl = canvas.getContext('webgl2', { alpha: true, premultipliedAlpha: false });
     if (!gl) {
         console.warn('No WebGL2');
-        return { cleanup() { }, reset() { }, setFlipRatio() { }, setPaused() { }, setShowDebug() { } };
+        return { cleanup() { }, reset() { }, setFlipRatio() { }, setPaused() { }, setShowDebug() { }, setTiltForce() { } };
     }
 
     const vs = compile(gl, gl.VERTEX_SHADER, VERT);
@@ -1251,6 +1257,9 @@ export function createFluidPool(
             dropCount = Math.floor(baseDropCount * SPAWN_THROTTLE_FACTOR);
         }
 
+        // Proactive cleanup: remove one settled bottom layer per click
+        removeBottomLayer();
+
         spawnQueue = {
             x, y,
             remaining: dropCount,
@@ -1355,6 +1364,38 @@ export function createFluidPool(
         }
     }
 
+    // Remove all non-immune particles within one dy band from the bottom. Returns count removed.
+    function removeBottomLayer(): number {
+        if (f.numParticles <= 0) return 0;
+
+        // Pass 1: find minY among non-immune settled particles
+        let minY = Infinity;
+        for (let i = 0; i < f.numParticles; i++) {
+            if (f.particleImmune[i] > 0) continue;
+            const y = f.particlePos[2 * i + 1];
+            if (y < minY) minY = y;
+        }
+        if (minY === Infinity) return 0;
+
+        // Pass 2: collect indices in bottom layer band [minY, minY + dy*0.5]
+        const threshold = minY + dy * 0.5;
+        const toRemove: number[] = [];
+        for (let i = 0; i < f.numParticles; i++) {
+            if (f.particleImmune[i] > 0) continue;
+            if (f.particlePos[2 * i + 1] <= threshold) {
+                toRemove.push(i);
+            }
+        }
+
+        // Swap-remove in descending index order
+        toRemove.sort((a, b) => b - a);
+        for (const idx of toRemove) {
+            if (idx < f.numParticles) f.swapRemoveParticle(idx);
+        }
+
+        return toRemove.length;
+    }
+
     function handlePointerMove(cx: number, cy: number) {
         const rc = canvas.getBoundingClientRect();
         const mx = cx - rc.left;
@@ -1380,19 +1421,24 @@ export function createFluidPool(
     listen(wrapper, 'mouseleave', handlePointerLeave as EventListener);
     listen(window, 'mouseup', handlePointerLeave as EventListener);
 
-    listen(wrapper, 'touchstart', ((e: TouchEvent) => {
-        e.preventDefault();
-        handlePointerMove(e.touches[0].clientX, e.touches[0].clientY);
-        startSpawn(e.touches[0].clientX, e.touches[0].clientY);
-    }) as EventListener, false);
-    listen(wrapper, 'touchmove', ((e: TouchEvent) => {
-        e.preventDefault();
-        handlePointerMove(e.touches[0].clientX, e.touches[0].clientY);
-    }) as EventListener, false);
-    listen(wrapper, 'touchend', ((e: TouchEvent) => {
-        e.preventDefault();
-        handlePointerLeave();
-    }) as EventListener, false);
+    // Touch listeners: only on desktop (non-touch) devices.
+    // On mobile, tilt is the sole interaction method.
+    const isMobile = 'ontouchstart' in window || window.matchMedia('(pointer: coarse)').matches;
+    if (!isMobile) {
+        listen(wrapper, 'touchstart', ((e: TouchEvent) => {
+            e.preventDefault();
+            handlePointerMove(e.touches[0].clientX, e.touches[0].clientY);
+            startSpawn(e.touches[0].clientX, e.touches[0].clientY);
+        }) as EventListener, false);
+        listen(wrapper, 'touchmove', ((e: TouchEvent) => {
+            e.preventDefault();
+            handlePointerMove(e.touches[0].clientX, e.touches[0].clientY);
+        }) as EventListener, false);
+        listen(wrapper, 'touchend', ((e: TouchEvent) => {
+            e.preventDefault();
+            handlePointerLeave();
+        }) as EventListener, false);
+    }
 
     // ── Loop ──
     let rafId = 0;
@@ -1401,13 +1447,14 @@ export function createFluidPool(
             if (!dead) {
                 if (scene.frameNr === 0) {
                     const cvs = gl!.canvas as HTMLCanvasElement;
-                    console.log(`[FluidPool] first frame: canvas ${cvs.width}x${cvs.height}, clientW=${cvs.clientWidth}, clientH=${cvs.clientHeight}`);
+                    console.log(`[FluidPool] first frame: canvas ${cvs.width}x${cvs.height}, clientW=${cvs.clientWidth}, clientH=${cvs.clientHeight}, dpr=${dpr}`);
                 }
                 if (!scene.paused) {
                     f.simulate(
                         scene.dt, scene.gravity, scene.flipRatio, scene.numPressureIters, scene.numParticleIters,
                         scene.overRelaxation, scene.compensateDrift, scene.separateParticles,
-                        scene.obstacleX, scene.obstacleY, scene.obstacleRadius, scene.obstacleVelX, scene.obstacleVelY
+                        scene.obstacleX, scene.obstacleY, scene.obstacleRadius, scene.obstacleVelX, scene.obstacleVelY,
+                        scene.tiltForceX, scene.tiltForceY
                     );
 
                     // Group falling cohesion (before idle wave)
@@ -1463,11 +1510,14 @@ export function createFluidPool(
 
                 // Render
                 const cvs = gl!.canvas as HTMLCanvasElement;
-                if (cvs.width !== cvs.clientWidth || cvs.height !== cvs.clientHeight) {
-                    cvs.width = cvs.clientWidth; cvs.height = cvs.clientHeight;
-                    const physPerPx = viewableSimHeight / cvs.height;
-                    viewWidth = cvs.width * physPerPx;
-                    viewHeight = cvs.height * physPerPx;
+                const targetW = Math.round(cvs.clientWidth * dpr);
+                const targetH = Math.round(cvs.clientHeight * dpr);
+                if (cvs.width !== targetW || cvs.height !== targetH) {
+                    cvs.width = targetW;
+                    cvs.height = targetH;
+                    const physPerPx = viewableSimHeight / cvs.clientHeight;
+                    viewWidth = cvs.clientWidth * physPerPx;
+                    viewHeight = cvs.clientHeight * physPerPx;
                     viewLeft = f.h;
                     viewBottom = f.h;
                 }
@@ -1553,5 +1603,6 @@ export function createFluidPool(
         setFlipRatio: (v: number) => { scene.flipRatio = v; },
         setPaused: (v: boolean) => { scene.paused = v; },
         setShowDebug: (v: boolean) => { scene.showDebug = v; },
+        setTiltForce: (x: number, y: number) => { scene.tiltForceX = x; scene.tiltForceY = y; },
     };
 }

@@ -3,6 +3,7 @@
 
 @font-face {
   font-family: 'Aeonik';
+  font-weight: 300;
   src: url('../public/Aeonik-Medium.ttf');
 }
 
@@ -33,4 +34,5 @@ body {
   position: relative;
   display: block;
   width: fit-content;
+  margin: 0 auto;
 }

@@ -1,7 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
 import { createFluidPool, type PoolAPI } from '../simulation/createFluidPool';
 
-export default function FluidCanvas() {
+interface FluidCanvasProps {
+    onApiReady?: (api: PoolAPI) => void;
+}
+
+export default function FluidCanvas({ onApiReady }: FluidCanvasProps) {
     const wrapperRef = useRef<HTMLDivElement>(null);
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const apiRef = useRef<PoolAPI | null>(null);
@@ -15,6 +19,7 @@ export default function FluidCanvas() {
         if (!w || !c) return;
         const api = createFluidPool(w, c);
         apiRef.current = api;
+        onApiReady?.(api);
         return () => { api.cleanup(); apiRef.current = null; };
     }, []);
 

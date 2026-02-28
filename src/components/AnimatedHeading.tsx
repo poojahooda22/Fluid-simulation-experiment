@@ -2,7 +2,7 @@ import { useEffect, useRef } from 'react';
 import gsap from 'gsap';
 
 const LINE1 = "Let's work";
-const LINE2 = "Together!";
+const LINE2 = "together!";
 const FULL_TEXT = `${LINE1} ${LINE2}`;
 
 function renderLine(
@@ -110,8 +110,8 @@ export default function AnimatedHeading() {
         <h1
             ref={containerRef}
             aria-label={FULL_TEXT}
-            className="heading-block pointer-events-auto text-white 
-            font-light text-[12rem] leading-[10rem] text-center cursor-pointer "
+            className="heading-block pointer-events-auto text-white
+            font-light text-[3rem] sm:text-[6rem] md:text-[8rem] lg:text-[12rem] leading-[2.8rem] sm:leading-[5.5rem] md:leading-[7rem] lg:leading-[10rem] text-center cursor-pointer "
         >
             <span className="heading-line">
                 {renderLine(LINE1, 0, charRefs)}
