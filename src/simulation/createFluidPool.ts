@@ -175,6 +175,7 @@ class FlipFluid {
     particleAngle: Float32Array;
     particleAngVel: Float32Array;
     particleImmune: Uint8Array;
+    particleCohesion: Float32Array;
     particleDensity: Float32Array;
     particleRestDensity: number;
 
@@ -233,6 +234,7 @@ class FlipFluid {
             this.particleAngVel[i] = (0.3 + Math.random() * 0.7) * (Math.random() < 0.5 ? 1 : -1);
         }
         this.particleImmune = new Uint8Array(this.maxParticles);
+        this.particleCohesion = new Float32Array(this.maxParticles);
         this.particleDensity = new Float32Array(this.fNumCells);
         this.particleRestDensity = 0.0;
 
@@ -334,6 +336,20 @@ class FlipFluid {
                             this.particlePos[2 * i + 1] -= dy;
                             this.particlePos[2 * id] += dx;
                             this.particlePos[2 * id + 1] += dy;
+
+                            // Velocity smoothing for settled pairs: blend horizontal
+                            // velocities so neighbors move coherently instead of fighting.
+                            const vxi = this.particleVel[2 * i], vyi = this.particleVel[2 * i + 1];
+                            const vxid = this.particleVel[2 * id], vyid = this.particleVel[2 * id + 1];
+                            const si2 = vxi * vxi + vyi * vyi;
+                            const sid2 = vxid * vxid + vyid * vyid;
+                            const SETTLE_SPEED2 = 0.20 * 0.20;
+                            if (si2 < SETTLE_SPEED2 && sid2 < SETTLE_SPEED2) {
+                                const blend = 0.01; // 1% per iter (doubled by symmetric visits ≈ 2%)
+                                const avgVx = 0.5 * (vxi + vxid);
+                                this.particleVel[2 * i] += (avgVx - vxi) * blend;
+                                this.particleVel[2 * id] += (avgVx - vxid) * blend;
+                            }
 
                             for (let k = 0; k < 3; k++) {
                                 const color0 = this.particleColor[3 * i + k];
@@ -439,6 +455,10 @@ class FlipFluid {
                     const impulseK = 2.0;
                     outVx += obstacleVelX * impulseK;
                     outVy += obstacleVelY * impulseK;
+                    // Stochastic cohesion: 70% chance to fall as group, 30% individually
+                    if (Math.random() < 0.70) {
+                        this.particleCohesion[i] = 1.0;
+                    }
                 }
 
                 // E) Convert back to world velocity
@@ -450,22 +470,22 @@ class FlipFluid {
             if (x < minX) {
                 x = minX;
                 const v = this.particleVel[2 * i];
-                this.particleVel[2 * i] = Math.abs(v) < 0.3 ? 0 : v * -0.5;
+                this.particleVel[2 * i] = Math.abs(v) < 0.3 ? 0 : v * -0.1;
             }
             if (x > maxX) {
                 x = maxX;
                 const v = this.particleVel[2 * i];
-                this.particleVel[2 * i] = Math.abs(v) < 0.3 ? 0 : v * -0.5;
+                this.particleVel[2 * i] = Math.abs(v) < 0.3 ? 0 : v * -0.1;
             }
             if (y < minY) {
                 y = minY;
                 const v = this.particleVel[2 * i + 1];
-                this.particleVel[2 * i + 1] = Math.abs(v) < 0.3 ? 0 : v * -0.5;
+                this.particleVel[2 * i + 1] = Math.abs(v) < 0.3 ? 0 : v * -0.1;
             }
             if (y > maxY) {
                 y = maxY;
                 const v = this.particleVel[2 * i + 1];
-                this.particleVel[2 * i + 1] = Math.abs(v) < 0.3 ? 0 : v * -0.5;
+                this.particleVel[2 * i + 1] = Math.abs(v) < 0.3 ? 0 : v * -0.1;
             }
             this.particlePos[2 * i] = x;
             this.particlePos[2 * i + 1] = y;
@@ -701,7 +721,7 @@ class FlipFluid {
                         this.v[top] - this.v[center];
 
                     if (this.particleRestDensity > 0.0 && compensateDrift) {
-                        const k = 0.5;
+                        const k = 1.0;
                         const compression = this.particleDensity[i * n + j] - this.particleRestDensity;
                         if (compression > 0.0)
                             div = div - k * compression;
@@ -739,6 +759,109 @@ class FlipFluid {
                 this.particleVel[2 * i] *= s;
                 this.particleVel[2 * i + 1] *= s;
             }
+        }
+    }
+
+    dampSettledParticles(threshold: number, maxDamp: number) {
+        const threshold2 = threshold * threshold;
+        for (let i = 0; i < this.numParticles; i++) {
+            const vx = this.particleVel[2 * i];
+            const vy = this.particleVel[2 * i + 1];
+            const s2 = vx * vx + vy * vy;
+            if (s2 < threshold2 && s2 > 0) {
+                const speed = Math.sqrt(s2);
+                const t = 1.0 - speed / threshold; // 1.0 at speed=0, 0.0 at threshold
+                const damp = 1.0 - maxDamp * t;
+                this.particleVel[2 * i] *= damp;
+                this.particleVel[2 * i + 1] *= damp;
+            }
+        }
+    }
+
+    applyFallingCohesion() {
+        const minDist = 2.0 * this.particleRadius + this.particleGap;
+        const recruitRadius = 4.0 * minDist;
+        const recruitRadius2 = recruitRadius * recruitRadius;
+        const h = 1.0 / this.fInvSpacing;
+        const fallingSpeed2 = 0.05 * 0.05;
+        const settledSpeed2 = 0.10 * 0.10;
+        const blendRate = 0.15;
+        const decayRate = 0.008;
+        const recruitImpulseFrac = 0.35;
+
+        for (let i = 0; i < this.numParticles; i++) {
+            if (this.particleCohesion[i] <= 0) continue;
+
+            const vx = this.particleVel[2 * i];
+            const vy = this.particleVel[2 * i + 1];
+            const speed2 = vx * vx + vy * vy;
+
+            // Re-settled: clear cohesion
+            if (speed2 < fallingSpeed2) {
+                this.particleCohesion[i] = 0;
+                continue;
+            }
+
+            const px = this.particlePos[2 * i];
+            const py = this.particlePos[2 * i + 1];
+
+            // Search neighbors via spatial hash (from last pushParticlesApart)
+            const pxi = Math.floor(px * this.pInvSpacing);
+            const pyi = Math.floor(py * this.pInvSpacing);
+            const x0 = Math.max(pxi - 1, 0);
+            const y0 = Math.max(pyi - 1, 0);
+            const x1 = Math.min(pxi + 1, this.pNumX - 1);
+            const y1 = Math.min(pyi + 1, this.pNumY - 1);
+
+            let grpVx = vx, grpVy = vy, grpCount = 1;
+
+            for (let xi = x0; xi <= x1; xi++) {
+                for (let yi = y0; yi <= y1; yi++) {
+                    const cellNr = xi * this.pNumY + yi;
+                    const cfirst = this.firstCellParticle[cellNr];
+                    const clast = this.firstCellParticle[cellNr + 1];
+                    for (let j = cfirst; j < clast; j++) {
+                        const id = this.cellParticleIds[j];
+                        if (id === i) continue;
+
+                        const ddx = this.particlePos[2 * id] - px;
+                        const ddy = this.particlePos[2 * id + 1] - py;
+                        const dd2 = ddx * ddx + ddy * ddy;
+                        if (dd2 > recruitRadius2) continue;
+
+                        // Same horizontal band check (within h)
+                        if (Math.abs(ddy) > h) continue;
+
+                        const nvx = this.particleVel[2 * id];
+                        const nvy = this.particleVel[2 * id + 1];
+                        const nspeed2 = nvx * nvx + nvy * nvy;
+
+                        if (this.particleCohesion[id] > 0) {
+                            // Both have cohesion: accumulate for group blend
+                            grpVx += nvx;
+                            grpVy += nvy;
+                            grpCount++;
+                        } else if (nspeed2 < settledSpeed2) {
+                            // Recruit settled neighbor into group
+                            this.particleCohesion[id] = 0.5;
+                            this.particleVel[2 * id] += vx * recruitImpulseFrac;
+                            this.particleVel[2 * id + 1] += vy * recruitImpulseFrac;
+                        }
+                    }
+                }
+            }
+
+            // Blend velocity toward group average
+            if (grpCount > 1) {
+                const avgVx = grpVx / grpCount;
+                const avgVy = grpVy / grpCount;
+                this.particleVel[2 * i] += (avgVx - vx) * blendRate;
+                this.particleVel[2 * i + 1] += (avgVy - vy) * blendRate;
+            }
+
+            // Decay cohesion
+            this.particleCohesion[i] -= decayRate;
+            if (this.particleCohesion[i] < 0) this.particleCohesion[i] = 0;
         }
     }
 
@@ -788,6 +911,7 @@ class FlipFluid {
             this.particleAngle[i] = this.particleAngle[last];
             this.particleAngVel[i] = this.particleAngVel[last];
             this.particleImmune[i] = this.particleImmune[last];
+            this.particleCohesion[i] = this.particleCohesion[last];
         }
         this.numParticles--;
     }
@@ -806,6 +930,7 @@ class FlipFluid {
             this.solveIncompressibility(numPressureIters, sdt, overRelaxation, compensateDrift);
             this.transferVelocities(false, flipRatio);
             this.dampVelocities(0.001);
+            this.dampSettledParticles(0.15, 0.03);
             this.clampVelocities(15.0);
         }
 
@@ -867,7 +992,7 @@ export function createFluidPool(
     // Particle size is controlled via res: lower res → bigger h → bigger r.
     // r/h = 0.3 (reference ratio) keeps FLIP grid coupling stable.
     const TARGET_RADIUS_PX = 7;  // desired rendered particle radius in CSS px
-    const GAP_PX = 8;            // desired visible gap between particle edges
+    const GAP_PX = 4;            // desired visible gap between particle edges
     const res = Math.round(0.3 * (canvas.clientHeight || window.innerHeight) / TARGET_RADIUS_PX);
 
     const tankHeight = 1.0 * simHeight;
@@ -876,7 +1001,7 @@ export function createFluidPool(
     const density = 1000.0;
 
     // initial fill: spawn across full width, ~35-40% height
-    const relWaterHeight = 0.60;
+    const relWaterHeight = 0.50;
     const relWaterWidth = 0.60;
 
     const gapSim = GAP_PX / cScale;
@@ -1173,6 +1298,7 @@ export function createFluidPool(
             f.particleAngle[idx] = Math.random() * Math.PI * 2;
             f.particleAngVel[idx] = (0.3 + Math.random() * 0.7) * (Math.random() < 0.5 ? 1 : -1);
             f.particleImmune[idx] = SPAWN_IMMUNE_FRAMES;
+            f.particleCohesion[idx] = 0.0;
 
             q.emitted++;
             q.remaining--;
@@ -1283,6 +1409,15 @@ export function createFluidPool(
                         scene.overRelaxation, scene.compensateDrift, scene.separateParticles,
                         scene.obstacleX, scene.obstacleY, scene.obstacleRadius, scene.obstacleVelX, scene.obstacleVelY
                     );
+
+                    // Group falling cohesion (before idle wave)
+                    f.applyFallingCohesion();
+
+                    // Idle wave: gentle coordinated sway (after simulate so pressure solver doesn't cancel it)
+                    if (scene.idleWaveEnabled) {
+                        f.applyIdleWave(scene.simTime, scene.dt,
+                            scene.idleWaveStrength, scene.idleWaveFrequency, scene.idleWaveNoise);
+                    }
 
                     scene.simTime += scene.dt;
 

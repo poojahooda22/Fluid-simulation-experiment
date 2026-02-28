@@ -1,5 +1,11 @@
 @import "tailwindcss";
 
+
+@font-face {
+  font-family: 'Aeonik';
+  src: url('../public/Aeonik-Medium.ttf');
+}
+
 * {
   margin: 0;
   padding: 0;
@@ -17,6 +23,14 @@ body,
 }
 
 body {
+  font-family: 'Aeonik';
   background-color: #1a2ffb;
   color: #fff;
+}
+
+/* Heading line underline */
+.heading-line {
+  position: relative;
+  display: block;
+  width: fit-content;
 }
