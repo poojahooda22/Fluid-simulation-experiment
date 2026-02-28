@@ -1087,9 +1087,12 @@ export function createFluidPool(
     let viewWidth = viewRight - viewLeft;
     let viewHeight = viewableSimHeight;
 
-    /** Imperatively size canvas to fill viewport. Returns true if size changed. */
+    /** Size canvas to match its CSS-laid-out parent container. Returns true if size changed. */
     function resizeCanvas(): boolean {
-        const { w, h } = getViewportSize();
+        const parentRect = canvas.parentElement!.getBoundingClientRect();
+        const w = parentRect.width;
+        const h = parentRect.height;
+        if (w === 0 || h === 0) return false; // not laid out yet
         canvas.style.width  = w + 'px';
         canvas.style.height = h + 'px';
 
@@ -1486,6 +1489,9 @@ export function createFluidPool(
         listen(window.visualViewport as unknown as EventTarget, 'resize', scheduleResize as EventListener);
         listen(window.visualViewport as unknown as EventTarget, 'scroll', scheduleResize as EventListener);
     }
+    const ro = new ResizeObserver(scheduleResize);
+    ro.observe(canvas.parentElement!);
+    rms.push(() => ro.disconnect());
 
     // ── Loop ──
     let rafId = 0;
