@@ -993,7 +993,7 @@ export function createFluidPool(
     const simHeight = 3.0;
     const MAX_DPR = 2.0;
     const dpr = Math.min(window.devicePixelRatio || 1, MAX_DPR);
-    const BOTTOM_FUDGE_PX = 10;
+    const BOTTOM_FUDGE_PX = 30;
 
     /** Authoritative viewport dimensions — uses visualViewport on mobile */
     function getViewportSize() {
