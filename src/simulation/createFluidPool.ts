@@ -1517,8 +1517,10 @@ export function createFluidPool(
                 if (cvs.width !== targetW || cvs.height !== targetH) {
                     cvs.width = targetW;
                     cvs.height = targetH;
-                    const physPerPx = viewableSimHeight / cvs.clientHeight;
-                    viewWidth = cvs.clientWidth * physPerPx;
+                    // Derive scale from grid width so particles fill edge-to-edge horizontally
+                    const gridViewW = (f.fNumX - 1) * f.h - f.h;
+                    const physPerPx = gridViewW / cvs.clientWidth;
+                    viewWidth = gridViewW;
                     viewHeight = cvs.clientHeight * physPerPx;
                     viewLeft = f.h;
                     viewBottom = f.h;
