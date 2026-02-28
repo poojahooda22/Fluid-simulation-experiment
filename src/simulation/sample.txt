@@ -1,0 +1,18 @@
+Root Cause (why previous attempts failed)
+The r/h ratio was 0.556 — particle diameter exceeded the grid cell size. This is a fundamental FLIP stability violation, not a separation solver issue. When minDist > h:
+
+Each grid cell has ≤1 particle → noisy P2G/G2P velocity transfer
+Pressure solver produces incorrect corrections → fights the separation solver
+No amount of separation iterations or hash rebuilds can fix grid-level noise
+What Changed
+#	Line	Change	Why
+1	715-719	res computed from TARGET_RADIUS_PX (was hardcoded 70)	Lower res → bigger h → bigger r while keeping r/h = 0.3
+2	733	r = 0.3 * h (was 0.4 * h + radiusAdd)	Reference ratio — proven stable. Removed the RADIUS_ADD_PX hack
+3	178	pInvSpacing = 1/(2.2*r + gap) (was 1/(2.0*r + gap))	9% safety margin on spatial hash cell, matches reference pattern
+4	698	numParticleIters = 2 (was 4)	Sufficient at minDist/h = 0.687
+Key Numbers (900px viewport)
+res ≈ 39, h ≈ 0.077, r = 0.023 → rendered radius ~7px (+2px from original 5px)
+minDist/h = 0.687 (was 1.27) — well within FLIP stable range
+r/h = 0.3 (was 0.556) — matches reference exactly
+Gap: 2px visible between particle edges
+To adjust: Change TARGET_RADIUS_PX (line 717) for particle size, GAP_PX (line 718) for gap. The grid resolution auto-adapts.

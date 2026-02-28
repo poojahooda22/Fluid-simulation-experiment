@@ -1,0 +1,59 @@
+Fix: Initial Fill Too Low (~4% Instead of 30-40%)
+Context
+On first load, the particle pool shows only ~4% fill height — far below the target of 30-40% (10-12 visible rows). The user wants a meaningfully filled simulation on startup without requiring clicks.
+
+Root Cause
+relWaterWidth = 0.30 spawns particles in a narrow column (30% of tank width). When gravity pulls these particles down, they spread horizontally to fill the full tank width, reducing the number of settled rows dramatically.
+
+Math trace (900px × 1600px viewport)
+
+Current: relWaterWidth = 0.30, relWaterHeight = 0.40
+→ numX = 19 columns, numY = 15 rows → 285 particles
+→ Spawns a narrow 19×15 hex block in left 30% of tank
+→ Gravity + pressure → particles spread to full width (~70 columns)
+→ 285 particles / 70 per row ≈ 4 settled rows → ~4% fill height
+The particles are created correctly (15 rows) but they're packed in a narrow column that thins out when it settles across the full width.
+
+Fix — Spawn Across Full Width
+File: src/simulation/createFluidPool.ts
+
+Change 1: Set relWaterWidth to 1.0 (line 778)
+
+const relWaterWidth = 1.0;  // was 0.30 — fill full tank width
+Spawning across the full width means particles don't need to spread horizontally. The 15 spawn rows remain ~15 settled rows → ~30% fill.
+
+Change 2: Adjust relWaterHeight for target fill (line 777)
+
+const relWaterHeight = 0.50;  // was 0.40 — target ~35-40% settled fill
+With full-width spawning, relWaterHeight directly controls the settled fill fraction (minus wall/grid padding overhead). 0.50 gives ~18 rows ≈ 35% fill, comfortably in the 30-40% target range.
+
+No other changes needed
+The spawn loop (lines 805-812), particle count computation (lines 789-793), and all physics code work correctly with these values. Only the two constants change.
+
+Expected particle counts (900px viewport)
+Metric	Current	After
+relWaterWidth	0.30	1.0
+relWaterHeight	0.40	0.50
+numX	19	~65
+numY	15	~18
+Total particles	~285	~1170
+Settled fill height	~4%	~35%
+Settled rows	~4	~18
+Stability Note
+GAP_PX = 8 gives minDist/h = 0.94, above the stability threshold of ~0.8. This may cause visible jitter/wobble in the settled layer. The existing dampVelocities(0.005), clampVelocities(10.0), and rest-state damping mitigate this but don't fully eliminate it. If jitter is observed, reducing GAP_PX to 4-5 would restore stability (minDist/h ≈ 0.77).
+
+Verification
+npx tsc -b --noEmit — clean build (no new code, just constant changes)
+npm run dev — visual check:
+On first load, particles form a visible pool covering ~30-40% of container height from the bottom
+Roughly 15-20 rows of particles visible
+Particles span the full width of the container (not clustered to one side)
+Mouse click still spawns additional particles on top
+No particles spawned outside tank boundaries
+Console log (frame 0): verify NumP shows ~1000+ particles
+User approved the plan
+Update Todos
+
+Set relWaterWidth to 1.0 (full tank width)
+
+Set relWaterHeight to 0.50 (target ~35% fill)
