@@ -10,37 +10,79 @@ const VERT = `#version 300 es
 precision highp float;
 in vec2 a_pos;
 in vec3 a_color;
+in float a_shape;
+in float a_angle;
 uniform vec2 u_res;
 uniform vec2 u_offset;
 uniform float u_ptSz;
+uniform float u_waveTime;
 out vec3 v_col;
+flat out float v_shape;
+flat out float v_angle;
 
 void main(){
   vec2 pos = a_pos - u_offset;
+  float wavePhase = 1.2 * u_waveTime + 1.0 * pos.y;
+  pos.x += 0.03 * sin(wavePhase);
   vec2 screenTransform = vec2(2.0 / u_res.x, 2.0 / u_res.y);
   gl_Position = vec4(pos * screenTransform - vec2(1.0, 1.0), 0.0, 1.0);
 
   gl_PointSize = u_ptSz;
   v_col = a_color;
+  v_shape = a_shape;
+  v_angle = a_angle;
 }`;
 
 const FRAG = `#version 300 es
-precision mediump float;
+precision highp float;
 in vec3 v_col;
+flat in float v_shape;
+flat in float v_angle;
 uniform float u_ptSz;
 out vec4 o;
 
 void main(){
-  float rx = 0.5 - gl_PointCoord.x;
-  float ry = 0.5 - gl_PointCoord.y;
-  float r2 = rx * rx + ry * ry;
-  if(r2 > 0.25) discard;
+  vec2 p = gl_PointCoord - 0.5;
+  float ca = cos(v_angle); float sa = sin(v_angle);
+  p = vec2(ca*p.x + sa*p.y, -sa*p.x + ca*p.y);
+  int s = int(v_shape + 0.5);
+  float a;
 
-  float dist = sqrt(r2);
-  vec3 col = v_col;
-  float edgeFade = 1.0 - smoothstep(0.4, 0.5, dist);
+  if(s == 1){
+    // Square — radius reduced by 1px
+    float shrinkSq = 1.0 / u_ptSz;
+    float outerSq = 0.42 - shrinkSq;
+    float d = max(abs(p.x), abs(p.y));
+    if(d > outerSq) discard;
+    a = 1.0 - smoothstep(outerSq - 0.10, outerSq, d);
+  } else if(s == 2){
+    // Triangle pointing up
+    float d1 = p.y + 0.30;
+    float d2 = 0.40 - (1.732 * abs(p.x) + p.y);
+    float d = min(d1, d2);
+    if(d < 0.0) discard;
+    a = smoothstep(0.0, 0.06, d);
+  } else if(s == 3){
+    // Plus
+    float hw = 0.10;
+    float hl = 0.42;
+    bool inV = abs(p.x) < hw && abs(p.y) < hl;
+    bool inH = abs(p.y) < hw && abs(p.x) < hl;
+    if(!inV && !inH) discard;
+    float dV = inV ? min(hw - abs(p.x), hl - abs(p.y)) : 0.0;
+    float dH = inH ? min(hl - abs(p.x), hw - abs(p.y)) : 0.0;
+    float d = max(dV, dH);
+    a = smoothstep(0.0, 0.04, d);
+  } else {
+    // Circle (default, shape 0) — radius reduced by 1px
+    float shrink = 1.0 / u_ptSz;
+    float outerR = 0.47 - shrink;
+    float d = length(p);
+    if(d > outerR) discard;
+    a = 1.0 - smoothstep(outerR - 0.10, outerR, d);
+  }
 
-  o = vec4(col, edgeFade);
+  o = vec4(v_col, a);
 }`;
 
 // Mesh Shaders for Obstacle Disk
@@ -62,7 +104,7 @@ void main(){
 }`;
 
 const MESH_FRAG = `#version 300 es
-precision mediump float;
+precision highp float;
 in vec3 v_col;
 out vec4 o;
 void main(){
@@ -73,7 +115,7 @@ void main(){
 const FLUID_CELL = 0;
 const AIR_CELL = 1;
 const SOLID_CELL = 2;
-const OBSTACLE_REPULSION = 5.0; // outward push strength, tunable 1.0–5.0
+const OBSTACLE_REPULSION = 10.0; // outward push strength, tunable 1.0–10.0
 
 // ═══ Particle Cleanup Tuning ═════════════════════════════════════
 const SPAWN_THROTTLE_THRESHOLD = 0.90; // fraction of maxParticles before throttling
@@ -129,6 +171,10 @@ class FlipFluid {
     particlePos: Float32Array;
     particleColor: Float32Array;
     particleVel: Float32Array;
+    particleShape: Float32Array;
+    particleAngle: Float32Array;
+    particleAngVel: Float32Array;
+    particleImmune: Uint8Array;
     particleDensity: Float32Array;
     particleRestDensity: number;
 
@@ -170,10 +216,23 @@ class FlipFluid {
         this.particlePos = new Float32Array(2 * this.maxParticles);
         this.particleColor = new Float32Array(3 * this.maxParticles);
         for (let i = 0; i < this.maxParticles; i++) {
+            this.particleColor[3 * i] = 1.0;
+            this.particleColor[3 * i + 1] = 1.0;
             this.particleColor[3 * i + 2] = 1.0;
         }
 
         this.particleVel = new Float32Array(2 * this.maxParticles);
+        this.particleShape = new Float32Array(this.maxParticles);
+        for (let i = 0; i < this.maxParticles; i++) {
+            this.particleShape[i] = i % 4;
+        }
+        this.particleAngle = new Float32Array(this.maxParticles);
+        this.particleAngVel = new Float32Array(this.maxParticles);
+        for (let i = 0; i < this.maxParticles; i++) {
+            this.particleAngle[i] = Math.random() * Math.PI * 2;
+            this.particleAngVel[i] = (0.3 + Math.random() * 0.7) * (Math.random() < 0.5 ? 1 : -1);
+        }
+        this.particleImmune = new Uint8Array(this.maxParticles);
         this.particleDensity = new Float32Array(this.fNumCells);
         this.particleRestDensity = 0.0;
 
@@ -213,6 +272,7 @@ class FlipFluid {
         const leftWall = wh;
         const rightWall = (this.fNumX - 1) * wh;
         const bottomWall = wh;
+        const topWall = (this.fNumY - 1) * wh;
 
         for (let iter = 0; iter < numIters; iter++) {
             // Rebuild spatial hash each iteration so moved particles are found
@@ -306,6 +366,11 @@ class FlipFluid {
                 if (distRight > 0 && distRight < halfDist) {
                     this.particlePos[2 * i] -= halfDist - distRight;
                 }
+                // Top wall
+                const distTop = topWall - this.particlePos[2 * i + 1];
+                if (distTop > 0 && distTop < halfDist) {
+                    this.particlePos[2 * i + 1] -= halfDist - distTop;
+                }
             }
         }
     }
@@ -330,7 +395,10 @@ class FlipFluid {
             const dy = y - obstacleY;
             const d2 = dx * dx + dy * dy;
 
-            if (d2 < minDist2) {
+            // Skip obstacle collision for immune particles (freshly spawned)
+            if (this.particleImmune[i] > 0) {
+                // immune: no obstacle interaction, still do wall collisions below
+            } else if (d2 < minDist2) {
                 const d = Math.sqrt(d2);
 
                 // Unit normal: obstacle center → particle
@@ -365,26 +433,39 @@ class FlipFluid {
                 outVx += repulse * nx;
                 outVy += repulse * ny;
 
+                // F) Velocity-dependent splash impulse
+                const obstSpeed2 = obstacleVelX * obstacleVelX + obstacleVelY * obstacleVelY;
+                if (obstSpeed2 > 0.25) {
+                    const impulseK = 2.0;
+                    outVx += obstacleVelX * impulseK;
+                    outVy += obstacleVelY * impulseK;
+                }
+
                 // E) Convert back to world velocity
                 this.particleVel[2 * i] = outVx + obstacleVelX;
                 this.particleVel[2 * i + 1] = outVy + obstacleVelY;
             }
 
+            // Speed-dependent wall bounce: slow → zero (no jitter), fast → bounce
             if (x < minX) {
                 x = minX;
-                this.particleVel[2 * i] *= -0.3;
+                const v = this.particleVel[2 * i];
+                this.particleVel[2 * i] = Math.abs(v) < 0.3 ? 0 : v * -0.5;
             }
             if (x > maxX) {
                 x = maxX;
-                this.particleVel[2 * i] *= -0.3;
+                const v = this.particleVel[2 * i];
+                this.particleVel[2 * i] = Math.abs(v) < 0.3 ? 0 : v * -0.5;
             }
             if (y < minY) {
                 y = minY;
-                this.particleVel[2 * i + 1] *= -0.3;
+                const v = this.particleVel[2 * i + 1];
+                this.particleVel[2 * i + 1] = Math.abs(v) < 0.3 ? 0 : v * -0.5;
             }
             if (y > maxY) {
                 y = maxY;
-                this.particleVel[2 * i + 1] *= -0.3;
+                const v = this.particleVel[2 * i + 1];
+                this.particleVel[2 * i + 1] = Math.abs(v) < 0.3 ? 0 : v * -0.5;
             }
             this.particlePos[2 * i] = x;
             this.particlePos[2 * i + 1] = y;
@@ -686,10 +767,9 @@ class FlipFluid {
     }
 
     updateParticleColors() {
-        // Keep particles simple blue
         for (let i = 0; i < this.numParticles; i++) {
-            this.particleColor[3 * i] = 0.1;
-            this.particleColor[3 * i + 1] = 0.4;
+            this.particleColor[3 * i] = 1.0;
+            this.particleColor[3 * i + 1] = 1.0;
             this.particleColor[3 * i + 2] = 1.0;
         }
     }
@@ -697,13 +777,17 @@ class FlipFluid {
     swapRemoveParticle(i: number) {
         const last = this.numParticles - 1;
         if (i < last) {
-            this.particlePos[2 * i]     = this.particlePos[2 * last];
+            this.particlePos[2 * i] = this.particlePos[2 * last];
             this.particlePos[2 * i + 1] = this.particlePos[2 * last + 1];
-            this.particleVel[2 * i]     = this.particleVel[2 * last];
+            this.particleVel[2 * i] = this.particleVel[2 * last];
             this.particleVel[2 * i + 1] = this.particleVel[2 * last + 1];
-            this.particleColor[3 * i]     = this.particleColor[3 * last];
+            this.particleColor[3 * i] = this.particleColor[3 * last];
             this.particleColor[3 * i + 1] = this.particleColor[3 * last + 1];
             this.particleColor[3 * i + 2] = this.particleColor[3 * last + 2];
+            this.particleShape[i] = this.particleShape[last];
+            this.particleAngle[i] = this.particleAngle[last];
+            this.particleAngVel[i] = this.particleAngVel[last];
+            this.particleImmune[i] = this.particleImmune[last];
         }
         this.numParticles--;
     }
@@ -722,7 +806,12 @@ class FlipFluid {
             this.solveIncompressibility(numPressureIters, sdt, overRelaxation, compensateDrift);
             this.transferVelocities(false, flipRatio);
             this.dampVelocities(0.001);
-            this.clampVelocities(10.0);
+            this.clampVelocities(15.0);
+        }
+
+        // Decrement immunity counters
+        for (let i = 0; i < this.numParticles; i++) {
+            if (this.particleImmune[i] > 0) this.particleImmune[i]--;
         }
 
         this.updateParticleColors();
@@ -754,7 +843,7 @@ export function createFluidPool(
         flipRatio: opts?.flipRatio ?? 0.90,
         numPressureIters: opts?.pressureIters ?? 80,
         numParticleIters: opts?.sepIters ?? 3,
-        overRelaxation: opts?.overRelax ?? 1.8,
+        overRelaxation: opts?.overRelax ?? 1.9,
         compensateDrift: true,
         separateParticles: true,
         obstacleX: 0.0,
@@ -768,7 +857,7 @@ export function createFluidPool(
         simTime: 0.0,
         idleWaveEnabled: true,
         idleWaveStrength: 0.60,
-        idleWaveFrequency: 1.2,
+        idleWaveFrequency: 3.2,
         idleWaveNoise: 0.06,
     };
 
@@ -788,7 +877,7 @@ export function createFluidPool(
 
     // initial fill: spawn across full width, ~35-40% height
     const relWaterHeight = 0.60;
-    const relWaterWidth = 0.70;
+    const relWaterWidth = 0.60;
 
     const gapSim = GAP_PX / cScale;
 
@@ -837,18 +926,26 @@ export function createFluidPool(
     for (let i = 0; i < f.fNumX; i++) {
         for (let j = 0; j < f.fNumY; j++) {
             let s = 1.0;
-            if (i === 0 || i === f.fNumX - 1 || j === 0)
+            if (i === 0 || i === f.fNumX - 1 || j === 0 || j === f.fNumY - 1)
                 s = 0.0;
             f.s[i * n + j] = s;
         }
     }
 
-    // ── View bounds: fluid region only (walls pushed off-screen) ──
-    const viewLeft = f.h;
-    const viewBottom = f.h;
+    // ── View bounds: flush with particle collision boundaries ──
+    // Particles are confined to [h + wallPad, (fNumY-1)*h - wallPad] vertically.
+    // Set view top = topmost particle visual edge so there's no gap at the canvas top.
+    const collisionPad = r + gapSim * 0.5; // same wallPad used in handleParticleCollisions
+    const viewableTop = (f.fNumY - 1) * f.h - collisionPad + r; // top particle visual edge
+    const viewableSimHeight = viewableTop - f.h;
+
+    let viewLeft = f.h;
+    let viewBottom = f.h;
     const viewRight = (f.fNumX - 1) * f.h;
-    const viewWidth = viewRight - viewLeft;
-    const viewHeight = simHeight - viewBottom;
+    let viewWidth = viewRight - viewLeft;
+    let viewHeight = viewableSimHeight;
+
+    console.log(`[FluidPool] init: ${f.numParticles} particles, grid ${f.fNumX}x${f.fNumY}, h=${f.h.toFixed(4)}, r=${r.toFixed(4)}, viewW=${viewWidth.toFixed(3)}, viewH=${viewHeight.toFixed(3)}, canvas=${canvas.clientWidth}x${canvas.clientHeight}`);
 
     // ── WebGL2 Rendering Setup ──
     const gl = canvas.getContext('webgl2', { alpha: true, premultipliedAlpha: false });
@@ -862,10 +959,15 @@ export function createFluidPool(
     const prog = gl.createProgram()!;
     gl.attachShader(prog, vs); gl.attachShader(prog, fs);
     gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+        const log = gl.getProgramInfoLog(prog);
+        console.error('[FluidPool] Particle program link failed:', log);
+    }
 
     const uRes = gl.getUniformLocation(prog, 'u_res')!;
     const uOff = gl.getUniformLocation(prog, 'u_offset')!;
     const uPt = gl.getUniformLocation(prog, 'u_ptSz')!;
+    const uWaveTime = gl.getUniformLocation(prog, 'u_waveTime')!;
     const vao = gl.createVertexArray()!;
     gl.bindVertexArray(vao);
 
@@ -882,6 +984,20 @@ export function createFluidPool(
     const aC = gl.getAttribLocation(prog, 'a_color');
     gl.enableVertexAttribArray(aC);
     gl.vertexAttribPointer(aC, 3, gl.FLOAT, false, 0, 0);
+
+    const sBuf = gl.createBuffer()!;
+    gl.bindBuffer(gl.ARRAY_BUFFER, sBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, f.particleShape.byteLength, gl.DYNAMIC_DRAW);
+    const aS = gl.getAttribLocation(prog, 'a_shape');
+    gl.enableVertexAttribArray(aS);
+    gl.vertexAttribPointer(aS, 1, gl.FLOAT, false, 0, 0);
+
+    const angBuf = gl.createBuffer()!;
+    gl.bindBuffer(gl.ARRAY_BUFFER, angBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, f.particleAngle.byteLength, gl.DYNAMIC_DRAW);
+    const aA = gl.getAttribLocation(prog, 'a_angle');
+    gl.enableVertexAttribArray(aA);
+    gl.vertexAttribPointer(aA, 1, gl.FLOAT, false, 0, 0);
     gl.bindVertexArray(null);
 
     // Mesh setup for obstacle
@@ -890,6 +1006,10 @@ export function createFluidPool(
     const m_prog = gl.createProgram()!;
     gl.attachShader(m_prog, m_vs); gl.attachShader(m_prog, m_fs);
     gl.linkProgram(m_prog);
+    if (!gl.getProgramParameter(m_prog, gl.LINK_STATUS)) {
+        const log = gl.getProgramInfoLog(m_prog);
+        console.error('[FluidPool] Mesh program link failed:', log);
+    }
 
     const m_uRes = gl.getUniformLocation(m_prog, 'u_res')!;
     const m_uOff = gl.getUniformLocation(m_prog, 'u_offset')!;
@@ -941,7 +1061,7 @@ export function createFluidPool(
         rms.push(() => el.removeEventListener(t, fn, o));
     };
 
-    const MOUSE_MAX_SPEED = 15.0; // clamp crazy interactions
+    const MOUSE_MAX_SPEED = 25.0; // clamp crazy interactions
 
     function setObstacle(x: number, y: number, reset: boolean) {
         let vx = 0.0;
@@ -982,46 +1102,83 @@ export function createFluidPool(
         scene.obstacleVelY = vy;
     }
 
-    function dropParticles(cx: number, cy: number) {
+    // ── Spawn queue for timed wave/stream emission ──
+    const SPAWN_BATCH_SIZE = 18;       // particles emitted per frame
+    const SPAWN_IMMUNE_FRAMES = 90;    // ~1.5s of obstacle immunity
+    let spawnQueue: {
+        x: number; y: number;
+        remaining: number;
+        emitted: number;
+        totalCount: number;
+        phase: number;
+    } | null = null;
+
+    function startSpawn(cx: number, cy: number) {
         const rc = canvas.getBoundingClientRect();
         const mx = cx - rc.left;
         const my = cy - rc.top;
-
         const x = viewLeft + (mx / canvas.clientWidth) * viewWidth;
         const y = viewBottom + ((canvas.clientHeight - my) / canvas.clientHeight) * viewHeight;
 
-        // Drop a cluster of particles, throttled when near capacity
         const baseDropCount = 250;
         let dropCount = baseDropCount;
         if (f.numParticles / f.maxParticles > SPAWN_THROTTLE_THRESHOLD) {
             dropCount = Math.floor(baseDropCount * SPAWN_THROTTLE_FACTOR);
         }
 
-        for (let i = 0; i < dropCount; i++) {
+        spawnQueue = {
+            x, y,
+            remaining: dropCount,
+            emitted: 0,
+            totalCount: dropCount,
+            phase: Math.random() * Math.PI * 2,
+        };
+    }
+
+    function emitSpawnBatch() {
+        if (!spawnQueue || spawnQueue.remaining <= 0) {
+            spawnQueue = null;
+            return;
+        }
+
+        const q = spawnQueue;
+        const batch = Math.min(SPAWN_BATCH_SIZE, q.remaining);
+        const colWidth = 0.08;
+        const colHeight = 0.6;
+        const waveAmp = 0.03;
+        const waveFreq = 12.0;
+
+        for (let b = 0; b < batch; b++) {
             let idx = f.numParticles;
             if (f.numParticles >= f.maxParticles) {
-                // Recycle oldest spawned particle (ring buffer from initialParticles to maxParticles)
                 const poolSize = f.maxParticles - initialParticles;
-                if (poolSize <= 0) break; // fallback if no extra buffer
+                if (poolSize <= 0) break;
                 idx = initialParticles + ((spawnIndex - initialParticles) % poolSize);
             } else {
                 f.numParticles++;
             }
             spawnIndex++;
 
-            // Random horizontal cluster around click, slightly randomized Y
-            const spreadX = (Math.random() - 0.5) * 0.4;
-            const spreadY = (Math.random() - 0.5) * 0.4;
+            const t = q.emitted / q.totalCount;
+            const yOff = -t * colHeight;
+            const xWave = waveAmp * Math.sin(waveFreq * t + q.phase);
+            const jitterX = (Math.random() - 0.5) * colWidth;
+            const jitterY = (Math.random() - 0.5) * (colHeight / q.totalCount) * 2;
 
-            f.particlePos[2 * idx] = x + spreadX;
-            f.particlePos[2 * idx + 1] = y + spreadY;
+            f.particlePos[2 * idx] = q.x + xWave + jitterX;
+            f.particlePos[2 * idx + 1] = q.y + yOff + jitterY;
+            f.particleVel[2 * idx] = (Math.random() - 0.5) * 0.3;
+            f.particleVel[2 * idx + 1] = -1.5 - Math.random() * 1.5;
+            f.particleShape[idx] = q.emitted % 4;
+            f.particleAngle[idx] = Math.random() * Math.PI * 2;
+            f.particleAngVel[idx] = (0.3 + Math.random() * 0.7) * (Math.random() < 0.5 ? 1 : -1);
+            f.particleImmune[idx] = SPAWN_IMMUNE_FRAMES;
 
-            // Straight downward bias, slower speed per user request
-            f.particleVel[2 * idx] = (Math.random() - 0.5) * 1.0;
-            f.particleVel[2 * idx + 1] = -1.0 - Math.random() * 2.0;
+            q.emitted++;
+            q.remaining--;
         }
 
-        // Queue excess particles for distributed removal
+        // Queue excess for distributed removal
         const excess = Math.max(0, f.numParticles - TARGET_PARTICLES);
         if (excess > pendingRemoval) {
             pendingRemoval = excess;
@@ -1091,7 +1248,7 @@ export function createFluidPool(
     setObstacle(-10, -10, true);
 
     listen(wrapper, 'mousedown', ((e: MouseEvent) => {
-        dropParticles(e.clientX, e.clientY);
+        startSpawn(e.clientX, e.clientY);
     }) as EventListener);
     listen(wrapper, 'mousemove', ((e: MouseEvent) => handlePointerMove(e.clientX, e.clientY)) as EventListener);
     listen(wrapper, 'mouseleave', handlePointerLeave as EventListener);
@@ -1100,7 +1257,7 @@ export function createFluidPool(
     listen(wrapper, 'touchstart', ((e: TouchEvent) => {
         e.preventDefault();
         handlePointerMove(e.touches[0].clientX, e.touches[0].clientY);
-        dropParticles(e.touches[0].clientX, e.touches[0].clientY);
+        startSpawn(e.touches[0].clientX, e.touches[0].clientY);
     }) as EventListener, false);
     listen(wrapper, 'touchmove', ((e: TouchEvent) => {
         e.preventDefault();
@@ -1114,113 +1271,133 @@ export function createFluidPool(
     // ── Loop ──
     let rafId = 0;
     function loop() {
-        if (!dead) {
-            if (!scene.paused) {
-                f.simulate(
-                    scene.dt, scene.gravity, scene.flipRatio, scene.numPressureIters, scene.numParticleIters,
-                    scene.overRelaxation, scene.compensateDrift, scene.separateParticles,
-                    scene.obstacleX, scene.obstacleY, scene.obstacleRadius, scene.obstacleVelX, scene.obstacleVelY
-                );
-
-                // Apply idle wave for gentle resting motion (after simulate so pressure solver doesn't cancel it)
-                if (scene.idleWaveEnabled) {
-                    f.applyIdleWave(scene.simTime, scene.dt,
-                        scene.idleWaveStrength, scene.idleWaveFrequency, scene.idleWaveNoise);
+        try {
+            if (!dead) {
+                if (scene.frameNr === 0) {
+                    const cvs = gl!.canvas as HTMLCanvasElement;
+                    console.log(`[FluidPool] first frame: canvas ${cvs.width}x${cvs.height}, clientW=${cvs.clientWidth}, clientH=${cvs.clientHeight}`);
                 }
-                scene.simTime += scene.dt;
+                if (!scene.paused) {
+                    f.simulate(
+                        scene.dt, scene.gravity, scene.flipRatio, scene.numPressureIters, scene.numParticleIters,
+                        scene.overRelaxation, scene.compensateDrift, scene.separateParticles,
+                        scene.obstacleX, scene.obstacleY, scene.obstacleRadius, scene.obstacleVelX, scene.obstacleVelY
+                    );
 
-                scene.frameNr++;
+                    scene.simTime += scene.dt;
 
-                // Distributed bottom removal (only active after a click-spawn)
-                if (pendingRemoval > 0) {
-                    const batch = Math.min(pendingRemoval, removalBatchSize);
-                    removeBottomDistributed(batch);
-                    pendingRemoval -= batch;
-                }
+                    // Process spawn queue (timed emission)
+                    emitSpawnBatch();
 
-                // Debug: highlight particles near obstacle
-                if (scene.showDebug && scene.obstacleX > -5.0) {
-                    const debugR2 = (scene.obstacleRadius + f.particleRadius) ** 2;
-                    let maxOverlap = 0, nearCount = 0;
+                    // Update particle rotation angles
                     for (let i = 0; i < f.numParticles; i++) {
-                        const ddx = f.particlePos[2 * i] - scene.obstacleX;
-                        const ddy = f.particlePos[2 * i + 1] - scene.obstacleY;
-                        const dist2 = ddx * ddx + ddy * ddy;
-                        if (dist2 < debugR2) {
-                            f.particleColor[3 * i] = 1.0;
-                            f.particleColor[3 * i + 1] = 0.3;
-                            f.particleColor[3 * i + 2] = 0.0;
-                            nearCount++;
-                            const overlap = Math.sqrt(debugR2) - Math.sqrt(dist2);
-                            if (overlap > maxOverlap) maxOverlap = overlap;
+                        f.particleAngle[i] += f.particleAngVel[i] * scene.dt;
+                    }
+
+                    scene.frameNr++;
+
+                    // Distributed bottom removal (only active after a click-spawn)
+                    if (pendingRemoval > 0) {
+                        const batch = Math.min(pendingRemoval, removalBatchSize);
+                        removeBottomDistributed(batch);
+                        pendingRemoval -= batch;
+                    }
+
+                    // Debug: highlight particles near obstacle
+                    if (scene.showDebug && scene.obstacleX > -5.0) {
+                        const debugR2 = (scene.obstacleRadius + f.particleRadius) ** 2;
+                        let maxOverlap = 0, nearCount = 0;
+                        for (let i = 0; i < f.numParticles; i++) {
+                            const ddx = f.particlePos[2 * i] - scene.obstacleX;
+                            const ddy = f.particlePos[2 * i + 1] - scene.obstacleY;
+                            const dist2 = ddx * ddx + ddy * ddy;
+                            if (dist2 < debugR2) {
+                                f.particleColor[3 * i] = 1.0;
+                                f.particleColor[3 * i + 1] = 0.3;
+                                f.particleColor[3 * i + 2] = 0.0;
+                                nearCount++;
+                                const overlap = Math.sqrt(debugR2) - Math.sqrt(dist2);
+                                if (overlap > maxOverlap) maxOverlap = overlap;
+                            }
+                        }
+                        if (scene.frameNr % 120 === 0 && nearCount > 0) {
+                            console.log(`[DEBUG] ${nearCount} particles in obstacle zone, max overlap: ${maxOverlap.toFixed(4)}`);
                         }
                     }
-                    if (scene.frameNr % 120 === 0 && nearCount > 0) {
-                        console.log(`[DEBUG] ${nearCount} particles in obstacle zone, max overlap: ${maxOverlap.toFixed(4)}`);
+                }
+
+                // Render
+                const cvs = gl!.canvas as HTMLCanvasElement;
+                if (cvs.width !== cvs.clientWidth || cvs.height !== cvs.clientHeight) {
+                    cvs.width = cvs.clientWidth; cvs.height = cvs.clientHeight;
+                    const physPerPx = viewableSimHeight / cvs.height;
+                    viewWidth = cvs.width * physPerPx;
+                    viewHeight = cvs.height * physPerPx;
+                    viewLeft = f.h;
+                    viewBottom = f.h;
+                }
+                gl!.viewport(0, 0, cvs.width, cvs.height);
+                gl!.clearColor(0, 0, 0, 0);
+                gl!.clear(gl!.COLOR_BUFFER_BIT | gl!.DEPTH_BUFFER_BIT);
+                gl!.enable(gl!.BLEND);
+                gl!.blendFunc(gl!.SRC_ALPHA, gl!.ONE_MINUS_SRC_ALPHA);
+
+                if (scene.frameNr % 120 === 0) {
+                    let moving = 0;
+                    const eps2 = 0.01 * 0.01;
+                    const speeds: number[] = [];
+                    for (let i = 0; i < f.numParticles; i++) {
+                        const vx = f.particleVel[2 * i];
+                        const vy = f.particleVel[2 * i + 1];
+                        const s2 = vx * vx + vy * vy;
+                        if (s2 > eps2) moving++;
+                        speeds.push(Math.sqrt(s2));
                     }
+                    speeds.sort((a, b) => a - b);
+                    const pct = (100 * moving / f.numParticles).toFixed(1);
+                    const median = speeds[Math.floor(speeds.length / 2)]?.toFixed(4) ?? '0';
+                    console.log(`[wave-debug] F${scene.frameNr}: ${pct}% moving, median speed: ${median}, N=${f.numParticles}`);
                 }
-            }
 
-            // Render
-            const cvs = gl!.canvas as HTMLCanvasElement;
-            if (cvs.width !== cvs.clientWidth || cvs.height !== cvs.clientHeight) {
-                cvs.width = cvs.clientWidth; cvs.height = cvs.clientHeight;
-                // note: ideally if resizing we should recreate grids, but we'll leave it
-            }
-            gl!.viewport(0, 0, cvs.width, cvs.height);
-            gl!.clearColor(0, 0, 0, 0);
-            gl!.clear(gl!.COLOR_BUFFER_BIT | gl!.DEPTH_BUFFER_BIT);
-            gl!.enable(gl!.BLEND);
-            gl!.blendFunc(gl!.SRC_ALPHA, gl!.ONE_MINUS_SRC_ALPHA);
+                const ptSz = 2.0 * f.particleRadius / viewWidth * cvs.width;
 
-            if (scene.frameNr % 120 === 0) {
-                let moving = 0;
-                const eps2 = 0.01 * 0.01;
-                const speeds: number[] = [];
-                for (let i = 0; i < f.numParticles; i++) {
-                    const vx = f.particleVel[2 * i];
-                    const vy = f.particleVel[2 * i + 1];
-                    const s2 = vx * vx + vy * vy;
-                    if (s2 > eps2) moving++;
-                    speeds.push(Math.sqrt(s2));
-                }
-                speeds.sort((a, b) => a - b);
-                const pct = (100 * moving / f.numParticles).toFixed(1);
-                const median = speeds[Math.floor(speeds.length / 2)]?.toFixed(4) ?? '0';
-                console.log(`[wave-debug] F${scene.frameNr}: ${pct}% moving, median speed: ${median}, N=${f.numParticles}`);
-            }
+                gl!.useProgram(prog);
+                gl!.uniform2f(uRes, viewWidth, viewHeight);
+                gl!.uniform2f(uOff, viewLeft, viewBottom);
+                gl!.uniform1f(uPt, ptSz);
+                gl!.uniform1f(uWaveTime, scene.simTime);
 
-            const ptSz = 2.0 * f.particleRadius / viewWidth * cvs.width;
+                gl!.bindVertexArray(vao);
+                gl!.bindBuffer(gl!.ARRAY_BUFFER, pBuf);
+                gl!.bufferData(gl!.ARRAY_BUFFER, f.particlePos, gl!.DYNAMIC_DRAW);
+                gl!.bindBuffer(gl!.ARRAY_BUFFER, cBuf);
+                gl!.bufferData(gl!.ARRAY_BUFFER, f.particleColor, gl!.DYNAMIC_DRAW);
+                gl!.bindBuffer(gl!.ARRAY_BUFFER, sBuf);
+                gl!.bufferData(gl!.ARRAY_BUFFER, f.particleShape, gl!.DYNAMIC_DRAW);
+                gl!.bindBuffer(gl!.ARRAY_BUFFER, angBuf);
+                gl!.bufferData(gl!.ARRAY_BUFFER, f.particleAngle, gl!.DYNAMIC_DRAW);
 
-            gl!.useProgram(prog);
-            gl!.uniform2f(uRes, viewWidth, viewHeight);
-            gl!.uniform2f(uOff, viewLeft, viewBottom);
-            gl!.uniform1f(uPt, ptSz);
-
-            gl!.bindVertexArray(vao);
-            gl!.bindBuffer(gl!.ARRAY_BUFFER, pBuf);
-            gl!.bufferData(gl!.ARRAY_BUFFER, f.particlePos, gl!.DYNAMIC_DRAW);
-            gl!.bindBuffer(gl!.ARRAY_BUFFER, cBuf);
-            gl!.bufferData(gl!.ARRAY_BUFFER, f.particleColor, gl!.DYNAMIC_DRAW);
-
-            gl!.drawArrays(gl!.POINTS, 0, f.numParticles);
-            gl!.bindVertexArray(null);
-
-            // Draw obstacle disk (debug only)
-            if (scene.showDebug && scene.obstacleX > -5.0) {
-                gl!.useProgram(m_prog);
-                gl!.uniform2f(m_uRes, viewWidth, viewHeight);
-                gl!.uniform2f(m_uOff, viewLeft, viewBottom);
-                gl!.uniform3f(m_uCol, 1.0, 0.0, 0.0);
-                gl!.uniform2f(m_uTrans, scene.obstacleX, scene.obstacleY);
-                gl!.uniform1f(m_uScale, scene.obstacleRadius + f.particleRadius);
-
-                gl!.bindVertexArray(mVao);
-                gl!.drawElements(gl!.TRIANGLES, 3 * numSegs, gl!.UNSIGNED_SHORT, 0);
+                gl!.drawArrays(gl!.POINTS, 0, f.numParticles);
                 gl!.bindVertexArray(null);
-            }
 
-            rafId = requestAnimationFrame(loop);
+                // Draw obstacle disk (debug only)
+                if (scene.showDebug && scene.obstacleX > -5.0) {
+                    gl!.useProgram(m_prog);
+                    gl!.uniform2f(m_uRes, viewWidth, viewHeight);
+                    gl!.uniform2f(m_uOff, viewLeft, viewBottom);
+                    gl!.uniform3f(m_uCol, 1.0, 0.0, 0.0);
+                    gl!.uniform2f(m_uTrans, scene.obstacleX, scene.obstacleY);
+                    gl!.uniform1f(m_uScale, scene.obstacleRadius + f.particleRadius);
+
+                    gl!.bindVertexArray(mVao);
+                    gl!.drawElements(gl!.TRIANGLES, 3 * numSegs, gl!.UNSIGNED_SHORT, 0);
+                    gl!.bindVertexArray(null);
+                }
+
+                rafId = requestAnimationFrame(loop);
+            }
+        } catch (err) {
+            console.error('[FluidPool] loop error:', err);
         }
     }
     rafId = requestAnimationFrame(loop);
