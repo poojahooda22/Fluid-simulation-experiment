@@ -963,8 +963,6 @@ export function createFluidPool(
     canvas: HTMLCanvasElement,
     opts?: PoolOptions,
 ): PoolAPI {
-    const container = canvas.parentElement!;
-
     // ── Setup Scene Options ──
     const scene = {
         gravity: opts?.gravity !== undefined ? opts.gravity : -9.81,
@@ -996,10 +994,10 @@ export function createFluidPool(
     const MAX_DPR = 2.0;
     const dpr = Math.min(window.devicePixelRatio || 1, MAX_DPR);
 
-    /** Authoritative viewport dimensions — reads the container's actual rendered size */
+    /** Authoritative viewport dimensions — uses visualViewport API for accuracy */
     function getViewportSize() {
-        const rect = container.getBoundingClientRect();
-        return { w: rect.width, h: rect.height };
+        const vv = window.visualViewport;
+        return { w: vv?.width ?? window.innerWidth, h: vv?.height ?? window.innerHeight };
     }
 
     const { w: initW, h: initH } = getViewportSize();
