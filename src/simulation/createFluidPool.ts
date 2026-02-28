@@ -1010,10 +1010,10 @@ export function createFluidPool(
     const isMobile = 'ontouchstart' in window || window.matchMedia('(pointer: coarse)').matches;
 
     // initial fill: on mobile spawn full-width so settled pool ≈ 50% height with no gap
-    const relWaterHeight = isMobile ? 0.45 : 0.50;
+    const relWaterHeight = isMobile ? 0.42 : 0.50;
     const relWaterWidth  = isMobile ? 1.0  : 0.60;
 
-    const gapSim = GAP_PX / cScale;
+    const gapSim = (isMobile ? GAP_PX - 5 : GAP_PX) / cScale;
 
     // compute number of particles — r/h = 0.3 matches reference for stable FLIP
     const r = 0.3 * h;
@@ -1549,7 +1549,7 @@ export function createFluidPool(
                 }
 
                 const basePtSz = 2.0 * f.particleRadius / viewWidth * cvs.width;
-                const ptSz = isMobile ? basePtSz - 2 * dpr : basePtSz;
+                const ptSz = isMobile ? basePtSz - 4 * dpr : basePtSz;
 
                 gl!.useProgram(prog);
                 gl!.uniform2f(uRes, viewWidth, viewHeight);
