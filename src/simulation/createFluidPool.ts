@@ -963,6 +963,8 @@ export function createFluidPool(
     canvas: HTMLCanvasElement,
     opts?: PoolOptions,
 ): PoolAPI {
+    const container = canvas.parentElement!;
+
     // ── Setup Scene Options ──
     const scene = {
         gravity: opts?.gravity !== undefined ? opts.gravity : -9.81,
@@ -993,12 +995,11 @@ export function createFluidPool(
     const simHeight = 3.0;
     const MAX_DPR = 2.0;
     const dpr = Math.min(window.devicePixelRatio || 1, MAX_DPR);
-    const BOTTOM_FUDGE_PX = 30;
 
-    /** Authoritative viewport dimensions — uses visualViewport on mobile */
+    /** Authoritative viewport dimensions — reads the container's actual rendered size */
     function getViewportSize() {
-        const vv = window.visualViewport;
-        return { w: vv?.width ?? window.innerWidth, h: vv?.height ?? window.innerHeight };
+        const rect = container.getBoundingClientRect();
+        return { w: rect.width, h: rect.height };
     }
 
     const { w: initW, h: initH } = getViewportSize();
@@ -1091,12 +1092,11 @@ export function createFluidPool(
     /** Imperatively size canvas to fill viewport. Returns true if size changed. */
     function resizeCanvas(): boolean {
         const { w, h } = getViewportSize();
-        const hExt = h + BOTTOM_FUDGE_PX;
         canvas.style.width  = w + 'px';
-        canvas.style.height = hExt + 'px';
+        canvas.style.height = h + 'px';
 
         const bufW = Math.round(w * dpr);
-        const bufH = Math.round(hExt * dpr);
+        const bufH = Math.round(h * dpr);
         if (canvas.width === bufW && canvas.height === bufH) return false;
 
         canvas.width  = bufW;
@@ -1105,7 +1105,7 @@ export function createFluidPool(
         const gridViewW = (f.fNumX - 1) * f.h - f.h;
         const physPerPx = gridViewW / w;
         viewWidth  = gridViewW;
-        viewHeight = hExt * physPerPx;
+        viewHeight = h * physPerPx;
         viewLeft   = f.h;
         viewBottom = Math.min(f.h, viewableTop - viewHeight);
         return true;
