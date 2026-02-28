@@ -111,12 +111,14 @@ export default function AnimatedHeading() {
             ref={containerRef}
             aria-label={FULL_TEXT}
             className="heading-block pointer-events-auto text-white
-            font-light text-[4.7rem] sm:text-[6rem] md:text-[8rem] lg:text-[12rem] leading-[2.8rem] sm:leading-[5.5rem] md:leading-[7rem] lg:leading-[10rem] text-center cursor-pointer "
+            font-light text-[4.7rem] sm:text-[6rem] md:text-[8rem] lg:text-[12rem] 
+            leading-[2.55rem] sm:leading-[5.25rem] md:leading-[6.75rem] lg:leading-[8.75rem] text-center cursor-pointer "
         >
             <span className="heading-line">
                 {renderLine(LINE1, 0, charRefs)}
             </span>
-            <span className="heading-line text-[4.7rem] sm:text-[7rem] md:text-[9.5rem] lg:text-[14rem] leading-[3.2rem] sm:leading-[6.5rem] md:leading-[8.5rem] lg:leading-[12rem]">
+            <span className="heading-line text-[4.7rem] sm:text-[7rem] md:text-[9.5rem] 
+            lg:text-[12rem] leading-[3.2rem] sm:leading-[6.5rem] md:leading-[8.5rem] lg:leading-[8rem]">
                 {renderLine(LINE2, line2Start, charRefs)}
             </span>
         </h1>

@@ -1009,9 +1009,9 @@ export function createFluidPool(
     // Mobile detection (used for fill height + touch listener gating)
     const isMobile = 'ontouchstart' in window || window.matchMedia('(pointer: coarse)').matches;
 
-    // initial fill: on mobile use taller column so settled pool ≈ 45% height
-    const relWaterHeight = isMobile ? 0.75 : 0.50;
-    const relWaterWidth = 0.60;
+    // initial fill: on mobile spawn full-width so settled pool ≈ 50% height with no gap
+    const relWaterHeight = isMobile ? 0.45 : 0.50;
+    const relWaterWidth  = isMobile ? 1.0  : 0.60;
 
     const gapSim = GAP_PX / cScale;
 
@@ -1417,16 +1417,16 @@ export function createFluidPool(
     // Set obstacle far away initially
     setObstacle(-10, -10, true);
 
-    listen(wrapper, 'mousedown', ((e: MouseEvent) => {
-        startSpawn(e.clientX, e.clientY);
-    }) as EventListener);
-    listen(wrapper, 'mousemove', ((e: MouseEvent) => handlePointerMove(e.clientX, e.clientY)) as EventListener);
-    listen(wrapper, 'mouseleave', handlePointerLeave as EventListener);
-    listen(window, 'mouseup', handlePointerLeave as EventListener);
-
-    // Touch listeners: only on desktop (non-touch) devices.
-    // On mobile, tilt is the sole interaction method.
+    // On mobile, no pointer/touch/mouse listeners — tilt is the sole interaction.
+    // On desktop, attach all mouse + touch listeners for spawn/drag.
     if (!isMobile) {
+        listen(wrapper, 'mousedown', ((e: MouseEvent) => {
+            startSpawn(e.clientX, e.clientY);
+        }) as EventListener);
+        listen(wrapper, 'mousemove', ((e: MouseEvent) => handlePointerMove(e.clientX, e.clientY)) as EventListener);
+        listen(wrapper, 'mouseleave', handlePointerLeave as EventListener);
+        listen(window, 'mouseup', handlePointerLeave as EventListener);
+
         listen(wrapper, 'touchstart', ((e: TouchEvent) => {
             e.preventDefault();
             handlePointerMove(e.touches[0].clientX, e.touches[0].clientY);
@@ -1546,7 +1546,8 @@ export function createFluidPool(
                     console.log(`[wave-debug] F${scene.frameNr}: ${pct}% moving, median speed: ${median}, N=${f.numParticles}`);
                 }
 
-                const ptSz = 2.0 * f.particleRadius / viewWidth * cvs.width;
+                const basePtSz = 2.0 * f.particleRadius / viewWidth * cvs.width;
+                const ptSz = isMobile ? basePtSz - 2 * dpr : basePtSz;
 
                 gl!.useProgram(prog);
                 gl!.uniform2f(uRes, viewWidth, viewHeight);
