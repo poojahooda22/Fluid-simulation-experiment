@@ -39,12 +39,11 @@ export default function FluidCanvas({ onApiReady }: FluidCanvasProps) {
             {/* pill overlay container — between canvas and wrapper */}
             <div
                 ref={pillContainerRef}
-                className="absolute left-0 bottom-0 z-[5] pointer-events-none"
-                style={{ width: '100%', height: '100%' }}
+                className="absolute inset-0 z-[5] pointer-events-none"
             />
 
-            {/* simulation canvas */}
-            <canvas ref={canvasRef} className="absolute left-0 bottom-0 block bg-[#1a2ffb]" />
+            {/* simulation canvas — CSS fills parent; JS only sets drawing buffer */}
+            <canvas ref={canvasRef} className="absolute inset-0 w-full h-full block bg-[#1a2ffb]" />
         </div>
     );
 }

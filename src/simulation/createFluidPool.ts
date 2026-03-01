@@ -1116,14 +1116,11 @@ export function createFluidPool(
     let viewWidth = viewRight - viewLeft;
     let viewHeight = viewableSimHeight;
 
-    /** Size canvas to match its CSS-laid-out parent container. Returns true if size changed. */
+    /** Update WebGL drawing buffer to match CSS-laid-out canvas size. Returns true if size changed. */
     function resizeCanvas(): boolean {
-        const parentRect = canvas.parentElement!.getBoundingClientRect();
-        const w = parentRect.width;
-        const h = parentRect.height;
+        const w = canvas.clientWidth;
+        const h = canvas.clientHeight;
         if (w === 0 || h === 0) return false; // not laid out yet
-        canvas.style.width  = w + 'px';
-        canvas.style.height = h + 'px';
 
         const bufW = Math.round(w * dpr);
         const bufH = Math.round(h * dpr);
@@ -1673,11 +1670,7 @@ export function createFluidPool(
         const ch = canvas.clientHeight;
         if (cw === 0 || ch === 0) return;
 
-        // Sync pill container size with canvas
-        if (pillContainer) {
-            pillContainer.style.width = canvas.style.width;
-            pillContainer.style.height = canvas.style.height;
-        }
+        // Pill container is CSS-sized (inset-0) — no JS override needed
 
         for (const pill of pills) {
             if (!pill.el) continue;
