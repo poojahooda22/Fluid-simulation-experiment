@@ -118,15 +118,37 @@ const SOLID_CELL = 2;
 const OBSTACLE_REPULSION = 3.5; // outward push strength (reduced from 10 to prevent jitter)
 
 // ═══ Pill Constants ═══════════════════════════════════════════════
-const PILL_LABELS = ["React", "Webgl", "Threejs"];
+const PILL_LABELS = ["React", "Webgl", "Threejs", "Typescript", "GSAP"];
 const PILL_DENSITY = 1000.0;  // slightly heavier than fluid (1000) — sinks but responds to flow
 const PILL_HH = 0.06;         // half-height in sim units (matches 4vh CSS)
 const PILL_HW = 0.18;         // half-width in sim units (matches 12vh CSS)
 const PILL_OBSTACLE_PUSH = 20.0;
-const PILL_DAMPING = 0.97;    // less damping for more responsive flow following
 const PILL_MAX_SPEED = 10.0;
 const PILL_RESTITUTION = 0.5; // bounciness for pill-pill collisions
 const PILL_REPULSION = 2.0;   // softer repulsion for pill-particle collisions
+
+// ═══ Debug ═══════════════════════════════════════════════════════
+const PILL_DEBUG = false;                // set true for per-frame pill diagnostics
+
+// ═══ Waterline Estimation ═══════════════════════════════════════
+const WATERLINE_SAMPLE_RADIUS = 0.4;     // horizontal band half-width for waterline sampling
+const WATERLINE_MIN_PARTICLES = 5;       // min particles in band to estimate waterline
+const WATERLINE_SMOOTH_RATE = 0.08;      // temporal smoothing (0=frozen, 1=instant)
+const WATERLINE_PERCENTILE_BLEND = 0.7;  // 0=mean, 1=max (0.7 ≈ 85th percentile)
+
+// ═══ Immersion-Based Buoyancy ═══════════════════════════════════
+const PILL_BUOYANCY_STRENGTH = 1.0;      // multiplier on immersion × |gravity| × mass
+const PILL_BUOYANCY_MAX_FORCE = 10.0;    // safety cap (× pill.mass)
+const PILL_FLOAT_OFFSET = 0.02;          // equilibrium center offset above waterline (sim units)
+const PILL_IMMERSION_RANGE = 0.12;       // Y depth over which immersion ramps 0→1 (~2× pill hh)
+const PILL_SURFACE_RESTORE = 3.0;        // spring force toward target band
+
+// ═══ Pill Drag Constants ═════════════════════════════════════════
+const PILL_DRAG_KX = 1.0;               // horizontal viscous drag coefficient
+const PILL_DRAG_KY = 2.5;               // vertical viscous drag (stronger to damp oscillation)
+const PILL_ANGULAR_DAMPING = 0.92;       // angular velocity decay per frame
+const PILL_MAX_ANGULAR_VEL = 1.5;        // cap on angular velocity (rad/s)
+const PILL_FLOW_TORQUE = 0.3;            // flow-alignment torque strength
 
 // ═══ Flow Coupling Constants ═══════════════════════════════════════
 const FLOW_COUPLING_RADIUS = 0.45;       // search radius around pill center (sim units)
@@ -142,6 +164,9 @@ interface Pill {
     vx: number; vy: number;       // velocity
     fx: number; fy: number;       // force accumulators (reset each frame)
     mass: number;
+    angle: number;                // rotation in radians
+    angVel: number;               // angular velocity (rad/s)
+    waterlineSmooth: number;      // temporally-smoothed local waterline Y estimate
     el: HTMLDivElement | null;
 }
 
@@ -1048,7 +1073,7 @@ export function createFluidPool(
 
     // initial fill: on mobile spawn full-width so settled pool ≈ 50% height with no gap
     const relWaterHeight = isMobile ? 0.42 : 0.50;
-    const relWaterWidth  = isMobile ? 1.0  : 0.60;
+    const relWaterWidth = isMobile ? 1.0 : 0.60;
 
     const gapSim = (isMobile ? GAP_PX - 5 : GAP_PX) / cScale;
 
@@ -1126,14 +1151,14 @@ export function createFluidPool(
         const bufH = Math.round(h * dpr);
         if (canvas.width === bufW && canvas.height === bufH) return false;
 
-        canvas.width  = bufW;
+        canvas.width = bufW;
         canvas.height = bufH;
 
         const gridViewW = (f.fNumX - 1) * f.h - f.h;
         const physPerPx = gridViewW / w;
-        viewWidth  = gridViewW;
+        viewWidth = gridViewW;
         viewHeight = h * physPerPx;
-        viewLeft   = f.h;
+        viewLeft = f.h;
         viewBottom = Math.min(f.h, viewableTop - viewHeight);
         return true;
     }
@@ -1175,6 +1200,9 @@ export function createFluidPool(
         vx: 0, vy: 0,
         fx: 0, fy: 0,
         mass: pillMass,
+        angle: (Math.random() - 0.5) * 0.15,
+        angVel: 0,
+        waterlineSmooth: NaN,
         el: null as HTMLDivElement | null,
     }));
 
@@ -1199,6 +1227,8 @@ export function createFluidPool(
         el.style.color = '#000';
         el.style.backgroundColor = '#ffffff';
         el.style.whiteSpace = 'nowrap';
+        el.style.zIndex = '100';
+        el.style.mixBlendMode = 'difference';
         el.style.userSelect = 'none';
         el.style.willChange = 'transform';
         el.style.transformOrigin = 'center center';
@@ -1496,7 +1526,7 @@ export function createFluidPool(
         }
     }
 
-    // ── Particle-based flow coupling: nudge pills toward local particle flow ──
+    // ── Flow coupling + immersion buoyancy + torque: single particle scan per pill ──
     function applyFlowCoupling() {
         const R = FLOW_COUPLING_RADIUS;
         const R2 = R * R;
@@ -1506,14 +1536,30 @@ export function createFluidPool(
             const stemHW = pill.hw - pill.hh;
             const capR = pill.hh;
             const insideR2 = (capR + pr) * (capR + pr);
+
+            // Flow coupling accumulators
             let sumWx = 0, sumWy = 0, sumW = 0;
             let count = 0;
+            let torqueSumL = 0, torqueSumR = 0;
+            let torqueCountL = 0, torqueCountR = 0;
+
+            // Waterline sampling accumulators (horizontal band, any Y)
+            let wlSumY = 0, wlMaxY = -Infinity, wlCount = 0;
 
             for (let i = 0; i < f.numParticles; i++) {
                 const px = f.particlePos[2 * i];
                 const py = f.particlePos[2 * i + 1];
                 const ddx = px - pill.cx;
                 const ddy = py - pill.cy;
+
+                // Waterline sampling: horizontal band (separate from coupling sphere)
+                if (Math.abs(ddx) < WATERLINE_SAMPLE_RADIUS) {
+                    wlSumY += py;
+                    if (py > wlMaxY) wlMaxY = py;
+                    wlCount++;
+                }
+
+                // Flow coupling: sphere check
                 const d2 = ddx * ddx + ddy * ddy;
                 if (d2 >= R2 || d2 < 1e-12) continue;
 
@@ -1524,32 +1570,90 @@ export function createFluidPool(
                 if (capsuleDist2 < insideR2) continue;
 
                 const d = Math.sqrt(d2);
-                const w = 1.0 - d / R;  // linear falloff
+                const w = 1.0 - d / R;
+
+                // Flow coupling accumulation
                 sumWx += w * f.particleVel[2 * i];
                 sumWy += w * f.particleVel[2 * i + 1];
                 sumW += w;
                 count++;
+
+                // Torque: track vertical flow velocity on left vs right side
+                if (ddx < 0) {
+                    torqueSumL += f.particleVel[2 * i + 1] * w;
+                    torqueCountL += w;
+                } else {
+                    torqueSumR += f.particleVel[2 * i + 1] * w;
+                    torqueCountR += w;
+                }
             }
 
-            if (count < FLOW_COUPLING_MIN_NEIGHBORS || sumW < 1e-8) continue;
-
-            const avgVx = sumWx / sumW;
-            const avgVy = sumWy / sumW;
-
-            let cfx = FLOW_COUPLING_H * (avgVx - pill.vx) * pill.mass;
-            let cfy = FLOW_COUPLING_V * (avgVy - pill.vy) * pill.mass;
-
-            // Clamp coupling force magnitude
-            const maxF = FLOW_COUPLING_MAX_FORCE * pill.mass;
-            const cfMag = Math.sqrt(cfx * cfx + cfy * cfy);
-            if (cfMag > maxF) {
-                const s = maxF / cfMag;
-                cfx *= s;
-                cfy *= s;
+            // --- Flow coupling (unchanged) ---
+            if (count >= FLOW_COUPLING_MIN_NEIGHBORS && sumW > 1e-8) {
+                const avgVx = sumWx / sumW;
+                const avgVy = sumWy / sumW;
+                let cfx = FLOW_COUPLING_H * (avgVx - pill.vx) * pill.mass;
+                let cfy = FLOW_COUPLING_V * (avgVy - pill.vy) * pill.mass;
+                const maxF = FLOW_COUPLING_MAX_FORCE * pill.mass;
+                const cfMag = Math.sqrt(cfx * cfx + cfy * cfy);
+                if (cfMag > maxF) {
+                    const s = maxF / cfMag;
+                    cfx *= s;
+                    cfy *= s;
+                }
+                pill.fx += cfx;
+                pill.fy += cfy;
             }
 
-            pill.fx += cfx;
-            pill.fy += cfy;
+            // --- Waterline estimation ---
+            if (wlCount >= WATERLINE_MIN_PARTICLES) {
+                const wlMeanY = wlSumY / wlCount;
+                const rawWaterline = wlMeanY + WATERLINE_PERCENTILE_BLEND * (wlMaxY - wlMeanY);
+                if (isNaN(pill.waterlineSmooth)) {
+                    pill.waterlineSmooth = rawWaterline;
+                } else {
+                    pill.waterlineSmooth += WATERLINE_SMOOTH_RATE * (rawWaterline - pill.waterlineSmooth);
+                }
+            }
+
+            // --- Immersion-based buoyancy ---
+            const waterline = pill.waterlineSmooth;
+            if (!isNaN(waterline)) {
+                const targetY = waterline + PILL_FLOAT_OFFSET;
+                const immersion = Math.max(0, Math.min(1,
+                    (targetY - pill.cy) / PILL_IMMERSION_RANGE));
+
+                let buoyF = PILL_BUOYANCY_STRENGTH * immersion * Math.abs(scene.gravity) * pill.mass;
+                buoyF = Math.min(buoyF, PILL_BUOYANCY_MAX_FORCE * pill.mass);
+                pill.fy += buoyF;
+
+                // Surface-restoring spring: gentle pull toward targetY
+                const deviation = pill.cy - targetY;
+                const restoreF = -PILL_SURFACE_RESTORE * deviation * pill.mass;
+                pill.fy += restoreF;
+
+                if (PILL_DEBUG && scene.frameNr % 60 === 0) {
+                    console.log(
+                        `Pill "${pill.label}": pillY=${pill.cy.toFixed(3)}` +
+                        ` waterline=${waterline.toFixed(3)}` +
+                        ` targetY=${targetY.toFixed(3)}` +
+                        ` immersion=${immersion.toFixed(3)}` +
+                        ` buoyF=${buoyF.toFixed(3)}` +
+                        ` restoreF=${restoreF.toFixed(3)}` +
+                        ` wlParticles=${wlCount}` +
+                        ` wlMaxY=${wlMaxY.toFixed(3)}` +
+                        ` wlMeanY=${(wlSumY / wlCount).toFixed(3)}`
+                    );
+                }
+            }
+
+            // --- Flow torque ---
+            if (torqueCountL > 0.5 && torqueCountR > 0.5) {
+                const vyLeft = torqueSumL / torqueCountL;
+                const vyRight = torqueSumR / torqueCountR;
+                const torque = PILL_FLOW_TORQUE * (vyRight - vyLeft);
+                pill.angVel += torque * scene.dt;
+            }
         }
     }
 
@@ -1590,15 +1694,16 @@ export function createFluidPool(
         const wallH = f.h;
 
         for (const pill of pills) {
-            // Gravity
+            // Full gravity; immersion buoyancy handles lift
             pill.fy += pill.mass * scene.gravity;
 
             // Tilt force (mobile)
             pill.fx += pill.mass * scene.tiltForceX;
             pill.fy += pill.mass * scene.tiltForceY;
 
-            // Flow coupling (applyFlowCoupling) replaces the old broken grid drag.
-            // Buoyancy is implicit via particle-pill collision reaction forces.
+            // Viscous drag (asymmetric: stronger vertical to damp oscillation)
+            pill.fx -= PILL_DRAG_KX * pill.vx * pill.mass;
+            pill.fy -= PILL_DRAG_KY * pill.vy * pill.mass;
 
             // Mouse obstacle push
             if (scene.obstacleX > -5.0) {
@@ -1615,13 +1720,9 @@ export function createFluidPool(
                 }
             }
 
-            // Integrate
+            // Integrate linear
             pill.vx += (pill.fx / pill.mass) * dt;
             pill.vy += (pill.fy / pill.mass) * dt;
-
-            // Damping
-            pill.vx *= PILL_DAMPING;
-            pill.vy *= PILL_DAMPING;
 
             // Clamp max speed
             const spd2 = pill.vx * pill.vx + pill.vy * pill.vy;
@@ -1633,6 +1734,15 @@ export function createFluidPool(
 
             pill.cx += pill.vx * dt;
             pill.cy += pill.vy * dt;
+
+            // Integrate angular
+            pill.angle += pill.angVel * dt;
+            pill.angVel *= PILL_ANGULAR_DAMPING;
+            if (Math.abs(pill.angVel) > PILL_MAX_ANGULAR_VEL) {
+                pill.angVel = Math.sign(pill.angVel) * PILL_MAX_ANGULAR_VEL;
+            }
+            // Gentle restore toward 0 (prevents permanent large tilt)
+            pill.angle *= 0.995;
 
             // Wall collisions
             const pad = 0.01;
@@ -1683,7 +1793,7 @@ export function createFluidPool(
             const w = pill.el.offsetWidth;
             const h = pill.el.offsetHeight;
 
-            pill.el.style.transform = `translate(${screenX - w / 2}px, ${screenY - h / 2}px)`;
+            pill.el.style.transform = `translate(${screenX - w / 2}px, ${screenY - h / 2}px) rotate(${-pill.angle}rad)`;
         }
     }
 

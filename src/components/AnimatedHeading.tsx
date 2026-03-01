@@ -110,7 +110,7 @@ export default function AnimatedHeading() {
         <h1
             ref={containerRef}
             aria-label={FULL_TEXT}
-            className="heading-block pointer-events-auto text-white
+            className="heading-block pointer-events-auto text-white select-none
             font-light text-[4.7rem] sm:text-[6rem] md:text-[8rem] lg:text-[12rem] 
             leading-[2.55rem] sm:leading-[5.25rem] md:leading-[6.75rem] lg:leading-[8.75rem] text-center cursor-pointer "
         >
