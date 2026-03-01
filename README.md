@@ -10,7 +10,7 @@ Currently, two official plugins are availab
 ## React Compiler
 The React Compiler is not enabled on this template because of its impact on dev & build performances.   se[this documenttion](https://react.dev/learn/react-compiler/installation)
 
-## Expanding the ESLint configuratio
+## Expanding the ESLint configurati
 
 If you are developing a production application, we recommend updating the configuration to enable type-
 
