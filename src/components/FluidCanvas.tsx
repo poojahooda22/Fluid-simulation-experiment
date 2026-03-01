@@ -29,10 +29,9 @@ export default function FluidCanvas({ onApiReady }: FluidCanvasProps) {
     useEffect(() => { apiRef.current?.setPaused(paused); }, [paused]);
 
     return (
-        <div className="relative w-full h-full overflow-hidden">
+        <div ref={wrapperRef} className="relative w-full h-full">
             {/* 2× interaction wrapper — extends beyond canvas for pointer capture */}
             <div
-                ref={wrapperRef}
                 className="absolute z-10"
                 style={{ width: '100%', height: '100%', top: '0%', left: '0%' }}
             />
