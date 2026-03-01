@@ -115,7 +115,35 @@ void main(){
 const FLUID_CELL = 0;
 const AIR_CELL = 1;
 const SOLID_CELL = 2;
-const OBSTACLE_REPULSION = 10.0; // outward push strength, tunable 1.0–10.0
+const OBSTACLE_REPULSION = 3.5; // outward push strength (reduced from 10 to prevent jitter)
+
+// ═══ Pill Constants ═══════════════════════════════════════════════
+const PILL_LABELS = ["React", "Webgl", "Threejs"];
+const PILL_DENSITY = 1000.0;  // slightly heavier than fluid (1000) — sinks but responds to flow
+const PILL_HH = 0.06;         // half-height in sim units (matches 4vh CSS)
+const PILL_HW = 0.18;         // half-width in sim units (matches 12vh CSS)
+const PILL_OBSTACLE_PUSH = 20.0;
+const PILL_DAMPING = 0.97;    // less damping for more responsive flow following
+const PILL_MAX_SPEED = 10.0;
+const PILL_RESTITUTION = 0.5; // bounciness for pill-pill collisions
+const PILL_REPULSION = 2.0;   // softer repulsion for pill-particle collisions
+
+// ═══ Flow Coupling Constants ═══════════════════════════════════════
+const FLOW_COUPLING_RADIUS = 0.45;       // search radius around pill center (sim units)
+const FLOW_COUPLING_H = 6.0;             // horizontal coupling strength
+const FLOW_COUPLING_V = 1.5;             // vertical coupling strength (weaker to prevent floating)
+const FLOW_COUPLING_MIN_NEIGHBORS = 4;   // min nearby particles to activate coupling
+const FLOW_COUPLING_MAX_FORCE = 15.0;    // cap on coupling force magnitude
+
+interface Pill {
+    label: string;
+    cx: number; cy: number;       // position in sim coords
+    hw: number; hh: number;       // half-width, half-height
+    vx: number; vy: number;       // velocity
+    fx: number; fy: number;       // force accumulators (reset each frame)
+    mass: number;
+    el: HTMLDivElement | null;
+}
 
 // ═══ Particle Cleanup Tuning ═════════════════════════════════════
 const SPAWN_THROTTLE_THRESHOLD = 0.90; // fraction of maxParticles before throttling
@@ -454,7 +482,7 @@ class FlipFluid {
                 // F) Velocity-dependent splash impulse
                 const obstSpeed2 = obstacleVelX * obstacleVelX + obstacleVelY * obstacleVelY;
                 if (obstSpeed2 > 0.25) {
-                    const impulseK = 2.0;
+                    const impulseK = 0.8;
                     outVx += obstacleVelX * impulseK;
                     outVy += obstacleVelY * impulseK;
                     // Stochastic cohesion: 70% chance to fall as group, 30% individually
@@ -931,9 +959,9 @@ class FlipFluid {
             this.updateParticleDensity();
             this.solveIncompressibility(numPressureIters, sdt, overRelaxation, compensateDrift);
             this.transferVelocities(false, flipRatio);
-            this.dampVelocities(0.001);
-            this.dampSettledParticles(0.15, 0.03);
-            this.clampVelocities(15.0);
+            this.dampVelocities(0.005);
+            this.dampSettledParticles(0.35, 0.08);
+            this.clampVelocities(8.0);
         }
 
         // Decrement immunity counters
@@ -961,6 +989,7 @@ function compile(gl: WebGL2RenderingContext, t: number, s: string) {
 export function createFluidPool(
     wrapper: HTMLDivElement,
     canvas: HTMLCanvasElement,
+    pillContainer: HTMLDivElement | null,
     opts?: PoolOptions,
 ): PoolAPI {
     // ── Setup Scene Options ──
@@ -1116,6 +1145,71 @@ export function createFluidPool(
 
     console.log(`[FluidPool] init: ${f.numParticles} particles, grid ${f.fNumX}x${f.fNumY}, h=${f.h.toFixed(4)}, r=${r.toFixed(4)}, viewW=${viewWidth.toFixed(3)}, viewH=${viewHeight.toFixed(3)}, canvas=${canvas.clientWidth}x${canvas.clientHeight}`);
 
+    // ── Pill Bodies ──
+    const pillHH = PILL_HH;
+    const pillHW = PILL_HW;
+    const capsuleArea = Math.PI * pillHH * pillHH + 4 * (pillHW - pillHH) * pillHH;
+    const pillMass = PILL_DENSITY * capsuleArea;
+
+    // Randomize initial X positions near the bottom, no overlap
+    const safeMinX = viewLeft + viewWidth * 0.1;
+    const safeMaxX = viewLeft + viewWidth * 0.9;
+    const minGap = viewWidth * 0.15;
+    const startY = viewBottom + viewHeight * 0.7;
+
+    const pillXPositions: number[] = [];
+    for (let i = 0; i < PILL_LABELS.length; i++) {
+        let x: number;
+        let attempts = 0;
+        do {
+            x = safeMinX + Math.random() * (safeMaxX - safeMinX);
+            attempts++;
+        } while (
+            attempts < 20 &&
+            pillXPositions.some(px => Math.abs(px - x) < minGap)
+        );
+        pillXPositions.push(x);
+    }
+
+    const pills: Pill[] = PILL_LABELS.map((label, i) => ({
+        label,
+        cx: pillXPositions[i], cy: startY,
+        hw: pillHW, hh: pillHH,
+        vx: 0, vy: 0,
+        fx: 0, fy: 0,
+        mass: pillMass,
+        el: null as HTMLDivElement | null,
+    }));
+
+    // Create pill DOM elements with fixed CSS sizing
+    for (const pill of pills) {
+        if (!pillContainer) continue;
+        const el = document.createElement('div');
+        el.style.position = 'absolute';
+        el.style.top = '0';
+        el.style.left = '0';
+        el.style.width = '12vh';
+        el.style.height = '4vh';
+        el.style.borderRadius = '2vh';
+        el.style.pointerEvents = 'none';
+        el.style.display = 'flex';
+        el.style.alignItems = 'center';
+        el.style.justifyContent = 'center';
+        el.style.fontFamily = "'Aeonik', sans-serif";
+        el.style.fontWeight = '300';
+        el.style.fontSize = '1rem';
+        el.style.letterSpacing = '0.02em';
+        el.style.color = '#000';
+        el.style.backgroundColor = '#ffffff';
+        el.style.whiteSpace = 'nowrap';
+        el.style.userSelect = 'none';
+        el.style.willChange = 'transform';
+        el.style.transformOrigin = 'center center';
+        el.textContent = pill.label;
+        pillContainer.appendChild(el);
+        pill.el = el;
+    }
+
     // ── WebGL2 Rendering Setup ──
     const gl = canvas.getContext('webgl2', { alpha: true, premultipliedAlpha: false });
     if (!gl) {
@@ -1230,16 +1324,20 @@ export function createFluidPool(
         rms.push(() => el.removeEventListener(t, fn, o));
     };
 
-    const MOUSE_MAX_SPEED = 25.0; // clamp crazy interactions
+    const MOUSE_MAX_SPEED = 12.0; // clamp crazy interactions (reduced from 25)
+    const MOUSE_SMOOTHING = 0.3;  // EMA alpha: lower = smoother, higher = responsive
 
+    // setObstacle: only stores position/velocity — grid marking moved to markAllSolids()
     function setObstacle(x: number, y: number, reset: boolean) {
         let vx = 0.0;
         let vy = 0.0;
         if (!reset) {
-            vx = (x - scene.obstacleX) / scene.dt;
-            vy = (y - scene.obstacleY) / scene.dt;
+            // Exponential moving average smoothing on mouse velocity
+            const rawVx = (x - scene.obstacleX) / scene.dt;
+            const rawVy = (y - scene.obstacleY) / scene.dt;
+            vx = scene.obstacleVelX + MOUSE_SMOOTHING * (rawVx - scene.obstacleVelX);
+            vy = scene.obstacleVelY + MOUSE_SMOOTHING * (rawVy - scene.obstacleVelY);
 
-            // Limit maximum obstacle speed to prevent physics explosions
             const speed = Math.sqrt(vx * vx + vy * vy);
             if (speed > MOUSE_MAX_SPEED) {
                 vx = (vx / speed) * MOUSE_MAX_SPEED;
@@ -1249,26 +1347,351 @@ export function createFluidPool(
 
         scene.obstacleX = x;
         scene.obstacleY = y;
-        const R = scene.obstacleRadius;
+        scene.obstacleVelX = vx;
+        scene.obstacleVelY = vy;
+    }
+
+    // Mark grid cells inside a capsule pill as solid, setting cell velocities to pill velocity
+    function markPillCells(pill: Pill) {
+        const n = f.fNumY;
+        const capR = pill.hh;
+        const stemHW = pill.hw - capR; // half-width of the rectangular stem
+
+        const iMin = Math.max(1, Math.floor((pill.cx - pill.hw) / f.h) - 1);
+        const iMax = Math.min(f.fNumX - 3, Math.ceil((pill.cx + pill.hw) / f.h) + 1);
+        const jMin = Math.max(1, Math.floor((pill.cy - capR) / f.h) - 1);
+        const jMax = Math.min(f.fNumY - 3, Math.ceil((pill.cy + capR) / f.h) + 1);
+
+        for (let i = iMin; i <= iMax; i++) {
+            for (let j = jMin; j <= jMax; j++) {
+                const cellCx = (i + 0.5) * f.h;
+                const cellCy = (j + 0.5) * f.h;
+                const dx = cellCx - pill.cx;
+                const dy = cellCy - pill.cy;
+
+                // Capsule SDF: clamp dx to stem range, measure distance from clamped point
+                const clampedDx = Math.max(-stemHW, Math.min(stemHW, dx));
+                const remDx = dx - clampedDx;
+                const dist2 = remDx * remDx + dy * dy;
+
+                if (dist2 < capR * capR) {
+                    f.s[i * n + j] = 0.0;
+                    f.u[i * n + j] = pill.vx;
+                    f.u[(i + 1) * n + j] = pill.vx;
+                    f.v[i * n + j] = pill.vy;
+                    f.v[i * n + j + 1] = pill.vy;
+                }
+            }
+        }
+    }
+
+    // Mark ALL solid cells: obstacle + pills. Called once per frame before f.simulate().
+    function markAllSolids() {
         const n = f.fNumY;
 
+        // Phase 1: Reset all interior cells to fluid-permeable
         for (let i = 1; i < f.fNumX - 2; i++) {
             for (let j = 1; j < f.fNumY - 2; j++) {
                 f.s[i * n + j] = 1.0;
-                const cdx = (i + 0.5) * f.h - x;
-                const cdy = (j + 0.5) * f.h - y;
+            }
+        }
+
+        // Phase 2: Mark mouse obstacle cells as solid
+        const ox = scene.obstacleX;
+        const oy = scene.obstacleY;
+        const R = scene.obstacleRadius;
+        const ovx = scene.obstacleVelX;
+        const ovy = scene.obstacleVelY;
+
+        for (let i = 1; i < f.fNumX - 2; i++) {
+            for (let j = 1; j < f.fNumY - 2; j++) {
+                const cdx = (i + 0.5) * f.h - ox;
+                const cdy = (j + 0.5) * f.h - oy;
                 if (cdx * cdx + cdy * cdy < R * R) {
                     f.s[i * n + j] = 0.0;
-                    f.u[i * n + j] = vx;
-                    f.u[(i + 1) * n + j] = vx;
-                    f.v[i * n + j] = vy;
-                    f.v[i * n + j + 1] = vy;
+                    f.u[i * n + j] = ovx;
+                    f.u[(i + 1) * n + j] = ovx;
+                    f.v[i * n + j] = ovy;
+                    f.v[i * n + j + 1] = ovy;
                 }
             }
         }
 
-        scene.obstacleVelX = vx;
-        scene.obstacleVelY = vy;
+        // Phase 3: Mark pill cells as solid
+        for (const pill of pills) {
+            markPillCells(pill);
+        }
+    }
+
+    // ── Pill–particle collision: pushes particles out of pills, accumulates forces on pills ──
+    function handlePillParticleCollisions() {
+        const pr = f.particleRadius;
+
+        for (const pill of pills) {
+            const stemHW = pill.hw - pill.hh;
+            const capR = pill.hh;
+            const minDist = capR + pr;
+            const minDist2 = minDist * minDist;
+
+            // Reset force accumulators
+            pill.fx = 0;
+            pill.fy = 0;
+
+            // AABB bounds for quick rejection
+            const aabbMinX = pill.cx - pill.hw - pr;
+            const aabbMaxX = pill.cx + pill.hw + pr;
+            const aabbMinY = pill.cy - pill.hh - pr;
+            const aabbMaxY = pill.cy + pill.hh + pr;
+
+            for (let i = 0; i < f.numParticles; i++) {
+                const px = f.particlePos[2 * i];
+                const py = f.particlePos[2 * i + 1];
+
+                // AABB pre-check
+                if (px < aabbMinX || px > aabbMaxX || py < aabbMinY || py > aabbMaxY) continue;
+
+                // Capsule distance: project onto spine segment
+                const dx = px - pill.cx;
+                const dy = py - pill.cy;
+                const clampedDx = Math.max(-stemHW, Math.min(stemHW, dx));
+                const remDx = dx - clampedDx;
+                const dist2 = remDx * remDx + dy * dy;
+
+                if (dist2 >= minDist2 || dist2 < 1e-12) continue;
+
+                const dist = Math.sqrt(dist2);
+                const nx = remDx / dist;
+                const ny = dy / dist;
+
+                // A) Push particle to capsule surface
+                const overlap = minDist - dist;
+                f.particlePos[2 * i] = pill.cx + clampedDx + nx * minDist;
+                f.particlePos[2 * i + 1] = pill.cy + ny * minDist;
+
+                // B) Velocity response: strip inward component, add repulsion
+                const relVx = f.particleVel[2 * i] - pill.vx;
+                const relVy = f.particleVel[2 * i + 1] - pill.vy;
+                const relVn = relVx * nx + relVy * ny;
+
+                let outVx = relVx;
+                let outVy = relVy;
+                if (relVn < 0.0) {
+                    outVx -= relVn * nx;
+                    outVy -= relVn * ny;
+                }
+
+                const repulse = PILL_REPULSION * (overlap / minDist);
+                outVx += repulse * nx;
+                outVy += repulse * ny;
+
+                // Damp outgoing velocity to reduce oscillation at pill boundary
+                const collisionDamp = 0.85;
+                outVx *= collisionDamp;
+                outVy *= collisionDamp;
+
+                f.particleVel[2 * i] = outVx + pill.vx;
+                f.particleVel[2 * i + 1] = outVy + pill.vy;
+
+                // C) Reaction force on pill (Newton's 3rd law)
+                pill.fx -= (outVx - relVx);
+                pill.fy -= (outVy - relVy);
+            }
+        }
+    }
+
+    // ── Particle-based flow coupling: nudge pills toward local particle flow ──
+    function applyFlowCoupling() {
+        const R = FLOW_COUPLING_RADIUS;
+        const R2 = R * R;
+        const pr = f.particleRadius;
+
+        for (const pill of pills) {
+            const stemHW = pill.hw - pill.hh;
+            const capR = pill.hh;
+            const insideR2 = (capR + pr) * (capR + pr);
+            let sumWx = 0, sumWy = 0, sumW = 0;
+            let count = 0;
+
+            for (let i = 0; i < f.numParticles; i++) {
+                const px = f.particlePos[2 * i];
+                const py = f.particlePos[2 * i + 1];
+                const ddx = px - pill.cx;
+                const ddy = py - pill.cy;
+                const d2 = ddx * ddx + ddy * ddy;
+                if (d2 >= R2 || d2 < 1e-12) continue;
+
+                // Exclude particles inside the capsule (collision artifacts)
+                const clampedDx = Math.max(-stemHW, Math.min(stemHW, ddx));
+                const remDx = ddx - clampedDx;
+                const capsuleDist2 = remDx * remDx + ddy * ddy;
+                if (capsuleDist2 < insideR2) continue;
+
+                const d = Math.sqrt(d2);
+                const w = 1.0 - d / R;  // linear falloff
+                sumWx += w * f.particleVel[2 * i];
+                sumWy += w * f.particleVel[2 * i + 1];
+                sumW += w;
+                count++;
+            }
+
+            if (count < FLOW_COUPLING_MIN_NEIGHBORS || sumW < 1e-8) continue;
+
+            const avgVx = sumWx / sumW;
+            const avgVy = sumWy / sumW;
+
+            let cfx = FLOW_COUPLING_H * (avgVx - pill.vx) * pill.mass;
+            let cfy = FLOW_COUPLING_V * (avgVy - pill.vy) * pill.mass;
+
+            // Clamp coupling force magnitude
+            const maxF = FLOW_COUPLING_MAX_FORCE * pill.mass;
+            const cfMag = Math.sqrt(cfx * cfx + cfy * cfy);
+            if (cfMag > maxF) {
+                const s = maxF / cfMag;
+                cfx *= s;
+                cfy *= s;
+            }
+
+            pill.fx += cfx;
+            pill.fy += cfy;
+        }
+    }
+
+    // ── Pill-pill AABB collision with elastic bounce ──
+    function resolvePillPillCollision(a: Pill, b: Pill) {
+        const margin = 0.01; // extra separation to prevent persistent contact
+        const overlapX = (a.hw + b.hw + margin) - Math.abs(a.cx - b.cx);
+        const overlapY = (a.hh + b.hh + margin) - Math.abs(a.cy - b.cy);
+        if (overlapX <= 0 || overlapY <= 0) return;
+
+        const totalMass = a.mass + b.mass;
+
+        if (overlapX < overlapY) {
+            // Separate along X
+            const sign = a.cx < b.cx ? -1 : 1;
+            a.cx += sign * overlapX * 0.5;
+            b.cx -= sign * overlapX * 0.5;
+            // Elastic collision along X with restitution
+            const va = a.vx;
+            const vb = b.vx;
+            a.vx = (va * (a.mass - PILL_RESTITUTION * b.mass) + b.mass * (1 + PILL_RESTITUTION) * vb) / totalMass;
+            b.vx = (vb * (b.mass - PILL_RESTITUTION * a.mass) + a.mass * (1 + PILL_RESTITUTION) * va) / totalMass;
+        } else {
+            // Separate along Y
+            const sign = a.cy < b.cy ? -1 : 1;
+            a.cy += sign * overlapY * 0.5;
+            b.cy -= sign * overlapY * 0.5;
+            // Elastic collision along Y with restitution
+            const va = a.vy;
+            const vb = b.vy;
+            a.vy = (va * (a.mass - PILL_RESTITUTION * b.mass) + b.mass * (1 + PILL_RESTITUTION) * vb) / totalMass;
+            b.vy = (vb * (b.mass - PILL_RESTITUTION * a.mass) + a.mass * (1 + PILL_RESTITUTION) * va) / totalMass;
+        }
+    }
+
+    // ── Pill dynamics: gravity, buoyancy, drag, obstacle push, walls ──
+    function updatePills(dt: number) {
+        const wallH = f.h;
+
+        for (const pill of pills) {
+            // Gravity
+            pill.fy += pill.mass * scene.gravity;
+
+            // Tilt force (mobile)
+            pill.fx += pill.mass * scene.tiltForceX;
+            pill.fy += pill.mass * scene.tiltForceY;
+
+            // Flow coupling (applyFlowCoupling) replaces the old broken grid drag.
+            // Buoyancy is implicit via particle-pill collision reaction forces.
+
+            // Mouse obstacle push
+            if (scene.obstacleX > -5.0) {
+                const odx = pill.cx - scene.obstacleX;
+                const ody = pill.cy - scene.obstacleY;
+                const odist = Math.sqrt(odx * odx + ody * ody);
+                const touchDist = scene.obstacleRadius + Math.max(pill.hw, pill.hh);
+                if (odist < touchDist && odist > 1e-6) {
+                    const overlap = touchDist - odist;
+                    pill.fx += PILL_OBSTACLE_PUSH * overlap * (odx / odist) * pill.mass;
+                    pill.fy += PILL_OBSTACLE_PUSH * overlap * (ody / odist) * pill.mass;
+                    pill.vx += scene.obstacleVelX * 0.3;
+                    pill.vy += scene.obstacleVelY * 0.3;
+                }
+            }
+
+            // Integrate
+            pill.vx += (pill.fx / pill.mass) * dt;
+            pill.vy += (pill.fy / pill.mass) * dt;
+
+            // Damping
+            pill.vx *= PILL_DAMPING;
+            pill.vy *= PILL_DAMPING;
+
+            // Clamp max speed
+            const spd2 = pill.vx * pill.vx + pill.vy * pill.vy;
+            if (spd2 > PILL_MAX_SPEED * PILL_MAX_SPEED) {
+                const s = PILL_MAX_SPEED / Math.sqrt(spd2);
+                pill.vx *= s;
+                pill.vy *= s;
+            }
+
+            pill.cx += pill.vx * dt;
+            pill.cy += pill.vy * dt;
+
+            // Wall collisions
+            const pad = 0.01;
+            const minX = wallH + pill.hw + pad;
+            const maxX = (f.fNumX - 1) * f.h - pill.hw - pad;
+            const minY = wallH + pill.hh + pad;
+            const maxY = (f.fNumY - 1) * f.h - pill.hh - pad;
+
+            if (pill.cx < minX) { pill.cx = minX; pill.vx = Math.abs(pill.vx) * 0.2; }
+            if (pill.cx > maxX) { pill.cx = maxX; pill.vx = -Math.abs(pill.vx) * 0.2; }
+            if (pill.cy < minY) {
+                pill.cy = minY;
+                pill.vy = Math.abs(pill.vy) < 0.3 ? 0 : Math.abs(pill.vy) * 0.2;
+            }
+            if (pill.cy > maxY) { pill.cy = maxY; pill.vy = -Math.abs(pill.vy) * 0.2; }
+
+            // Reset forces for next frame
+            pill.fx = 0;
+            pill.fy = 0;
+        }
+
+        // Pill-pill collisions
+        for (let a = 0; a < pills.length; a++) {
+            for (let b = a + 1; b < pills.length; b++) {
+                resolvePillPillCollision(pills[a], pills[b]);
+            }
+        }
+    }
+
+    // ── Sync pill DOM element positions to simulation state ──
+    // Dimensions (width/height/border-radius/font-size) are set once via fixed CSS vh units
+    // in the DOM creation above — only the transform position is updated per frame.
+    function syncPillDOM() {
+        const cw = canvas.clientWidth;
+        const ch = canvas.clientHeight;
+        if (cw === 0 || ch === 0) return;
+
+        // Sync pill container size with canvas
+        if (pillContainer) {
+            pillContainer.style.width = canvas.style.width;
+            pillContainer.style.height = canvas.style.height;
+        }
+
+        for (const pill of pills) {
+            if (!pill.el) continue;
+
+            // Sim → screen conversion
+            const screenX = ((pill.cx - viewLeft) / viewWidth) * cw;
+            const screenY = (1 - (pill.cy - viewBottom) / viewHeight) * ch;
+
+            // Read actual rendered size for centering offset
+            const w = pill.el.offsetWidth;
+            const h = pill.el.offsetHeight;
+
+            pill.el.style.transform = `translate(${screenX - w / 2}px, ${screenY - h / 2}px)`;
+        }
     }
 
     // ── Spawn queue for timed wave/stream emission ──
@@ -1503,12 +1926,20 @@ export function createFluidPool(
                     console.log(`[FluidPool] first frame: canvas ${cvs.width}x${cvs.height}, clientW=${cvs.clientWidth}, clientH=${cvs.clientHeight}, dpr=${dpr}`);
                 }
                 if (!scene.paused) {
+                    // Mark all solid cells (obstacle + pills) before simulation
+                    markAllSolids();
+
                     f.simulate(
                         scene.dt, scene.gravity, scene.flipRatio, scene.numPressureIters, scene.numParticleIters,
                         scene.overRelaxation, scene.compensateDrift, scene.separateParticles,
                         scene.obstacleX, scene.obstacleY, scene.obstacleRadius, scene.obstacleVelX, scene.obstacleVelY,
                         scene.tiltForceX, scene.tiltForceY
                     );
+
+                    // Pill–particle collision + flow coupling + pill dynamics
+                    handlePillParticleCollisions();
+                    applyFlowCoupling();
+                    updatePills(scene.dt);
 
                     // Group falling cohesion (before idle wave)
                     f.applyFallingCohesion();
@@ -1624,6 +2055,9 @@ export function createFluidPool(
                     gl!.bindVertexArray(null);
                 }
 
+                // Sync pill overlay positions
+                syncPillDOM();
+
                 rafId = requestAnimationFrame(loop);
             }
         } catch (err) {
@@ -1640,6 +2074,14 @@ export function createFluidPool(
         for (const fn of rms) fn();
         gl!.deleteProgram(prog); gl!.deleteShader(vs); gl!.deleteShader(fs);
         gl!.deleteProgram(m_prog); gl!.deleteShader(m_vs); gl!.deleteShader(m_fs);
+
+        // Remove pill DOM elements
+        for (const pill of pills) {
+            if (pill.el && pill.el.parentNode) {
+                pill.el.parentNode.removeChild(pill.el);
+            }
+            pill.el = null;
+        }
     }
 
     return {

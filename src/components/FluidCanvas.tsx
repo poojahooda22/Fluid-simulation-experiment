@@ -8,6 +8,7 @@ interface FluidCanvasProps {
 export default function FluidCanvas({ onApiReady }: FluidCanvasProps) {
     const wrapperRef = useRef<HTMLDivElement>(null);
     const canvasRef = useRef<HTMLCanvasElement>(null);
+    const pillContainerRef = useRef<HTMLDivElement>(null);
     const apiRef = useRef<PoolAPI | null>(null);
 
     const [paused] = useState(false);
@@ -15,9 +16,9 @@ export default function FluidCanvas({ onApiReady }: FluidCanvasProps) {
 
     // one-off init + full cleanup
     useEffect(() => {
-        const w = wrapperRef.current, c = canvasRef.current;
+        const w = wrapperRef.current, c = canvasRef.current, pc = pillContainerRef.current;
         if (!w || !c) return;
-        const api = createFluidPool(w, c);
+        const api = createFluidPool(w, c, pc, undefined);
         apiRef.current = api;
         onApiReady?.(api);
         return () => { api.cleanup(); apiRef.current = null; };
@@ -34,6 +35,13 @@ export default function FluidCanvas({ onApiReady }: FluidCanvasProps) {
                 ref={wrapperRef}
                 className="absolute z-10"
                 style={{ width: '100%', height: '100%', top: '0%', left: '0%' }}
+            />
+
+            {/* pill overlay container — between canvas and wrapper */}
+            <div
+                ref={pillContainerRef}
+                className="absolute left-0 bottom-0 z-[5] pointer-events-none"
+                style={{ width: '100%', height: '100%' }}
             />
 
             {/* simulation canvas */}
