@@ -12,7 +12,7 @@ The React Compiler is not enabled on this template because of its impact on dev 
 
 ## Expanding the ESLint configurati
 
-If you are developing a production application, we recommend updating the configuration to enable typ
+If you are developing a production application, we recommend updating the configuration to enable ty
 
 ```js
 export default defineConfig([
