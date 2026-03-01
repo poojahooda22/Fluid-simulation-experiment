@@ -126,6 +126,7 @@ const PILL_OBSTACLE_PUSH = 20.0;
 const PILL_MAX_SPEED = 10.0;
 const PILL_RESTITUTION = 0.5; // bounciness for pill-pill collisions
 const PILL_REPULSION = 2.0;   // softer repulsion for pill-particle collisions
+const MOBILE_MAX_WIDTH = 768; // pills hidden at or below this viewport width
 
 // ═══ Debug ═══════════════════════════════════════════════════════
 const PILL_DEBUG = false;                // set true for per-frame pill diagnostics
@@ -1141,6 +1142,8 @@ export function createFluidPool(
     let viewWidth = viewRight - viewLeft;
     let viewHeight = viewableSimHeight;
 
+    let pillsInitialized = false;
+
     /** Update WebGL drawing buffer to match CSS-laid-out canvas size. Returns true if size changed. */
     function resizeCanvas(): boolean {
         const w = canvas.clientWidth;
@@ -1160,6 +1163,17 @@ export function createFluidPool(
         viewHeight = h * physPerPx;
         viewLeft = f.h;
         viewBottom = Math.min(f.h, viewableTop - viewHeight);
+
+        // Toggle pills based on viewport width (only after pills are initialized)
+        if (pillsInitialized) {
+            const isMobile = w <= MOBILE_MAX_WIDTH;
+            if (isMobile && pills.length > 0) {
+                destroyPills();
+            } else if (!isMobile && pills.length === 0) {
+                createPills();
+            }
+        }
+
         return true;
     }
 
@@ -1173,69 +1187,87 @@ export function createFluidPool(
     const capsuleArea = Math.PI * pillHH * pillHH + 4 * (pillHW - pillHH) * pillHH;
     const pillMass = PILL_DENSITY * capsuleArea;
 
-    // Randomize initial X positions near the bottom, no overlap
-    const safeMinX = viewLeft + viewWidth * 0.1;
-    const safeMaxX = viewLeft + viewWidth * 0.9;
-    const minGap = viewWidth * 0.15;
-    const startY = viewBottom + viewHeight * 0.7;
+    let pills: Pill[] = [];
 
-    const pillXPositions: number[] = [];
-    for (let i = 0; i < PILL_LABELS.length; i++) {
-        let x: number;
-        let attempts = 0;
-        do {
-            x = safeMinX + Math.random() * (safeMaxX - safeMinX);
-            attempts++;
-        } while (
-            attempts < 20 &&
-            pillXPositions.some(px => Math.abs(px - x) < minGap)
-        );
-        pillXPositions.push(x);
+    function createPills() {
+        // Randomize initial X positions, no overlap
+        const safeMinX = viewLeft + viewWidth * 0.1;
+        const safeMaxX = viewLeft + viewWidth * 0.9;
+        const minGap = viewWidth * 0.15;
+        const startY = viewBottom + viewHeight * 0.7;
+
+        const pillXPositions: number[] = [];
+        for (let i = 0; i < PILL_LABELS.length; i++) {
+            let x: number;
+            let attempts = 0;
+            do {
+                x = safeMinX + Math.random() * (safeMaxX - safeMinX);
+                attempts++;
+            } while (
+                attempts < 20 &&
+                pillXPositions.some(px => Math.abs(px - x) < minGap)
+            );
+            pillXPositions.push(x);
+        }
+
+        pills = PILL_LABELS.map((label, i) => ({
+            label,
+            cx: pillXPositions[i], cy: startY,
+            hw: pillHW, hh: pillHH,
+            vx: 0, vy: 0,
+            fx: 0, fy: 0,
+            mass: pillMass,
+            angle: (Math.random() - 0.5) * 0.15,
+            angVel: 0,
+            waterlineSmooth: NaN,
+            el: null as HTMLDivElement | null,
+        }));
+
+        // Create pill DOM elements with fixed CSS sizing
+        for (const pill of pills) {
+            if (!pillContainer) continue;
+            const el = document.createElement('div');
+            el.style.position = 'absolute';
+            el.style.top = '0';
+            el.style.left = '0';
+            el.style.width = '12vh';
+            el.style.height = '4vh';
+            el.style.borderRadius = '2vh';
+            el.style.pointerEvents = 'none';
+            el.style.display = 'flex';
+            el.style.alignItems = 'center';
+            el.style.justifyContent = 'center';
+            el.style.fontFamily = "'Aeonik', sans-serif";
+            el.style.fontWeight = '300';
+            el.style.fontSize = '1rem';
+            el.style.letterSpacing = '0.02em';
+            el.style.color = '#000';
+            el.style.backgroundColor = '#ffffff';
+            el.style.whiteSpace = 'nowrap';
+            el.style.zIndex = '100';
+            el.style.mixBlendMode = 'difference';
+            el.style.userSelect = 'none';
+            el.style.willChange = 'transform';
+            el.style.transformOrigin = 'center center';
+            el.textContent = pill.label;
+            pillContainer.appendChild(el);
+            pill.el = el;
+        }
     }
 
-    const pills: Pill[] = PILL_LABELS.map((label, i) => ({
-        label,
-        cx: pillXPositions[i], cy: startY,
-        hw: pillHW, hh: pillHH,
-        vx: 0, vy: 0,
-        fx: 0, fy: 0,
-        mass: pillMass,
-        angle: (Math.random() - 0.5) * 0.15,
-        angVel: 0,
-        waterlineSmooth: NaN,
-        el: null as HTMLDivElement | null,
-    }));
-
-    // Create pill DOM elements with fixed CSS sizing
-    for (const pill of pills) {
-        if (!pillContainer) continue;
-        const el = document.createElement('div');
-        el.style.position = 'absolute';
-        el.style.top = '0';
-        el.style.left = '0';
-        el.style.width = '12vh';
-        el.style.height = '4vh';
-        el.style.borderRadius = '2vh';
-        el.style.pointerEvents = 'none';
-        el.style.display = 'flex';
-        el.style.alignItems = 'center';
-        el.style.justifyContent = 'center';
-        el.style.fontFamily = "'Aeonik', sans-serif";
-        el.style.fontWeight = '300';
-        el.style.fontSize = '1rem';
-        el.style.letterSpacing = '0.02em';
-        el.style.color = '#000';
-        el.style.backgroundColor = '#ffffff';
-        el.style.whiteSpace = 'nowrap';
-        el.style.zIndex = '100';
-        el.style.mixBlendMode = 'difference';
-        el.style.userSelect = 'none';
-        el.style.willChange = 'transform';
-        el.style.transformOrigin = 'center center';
-        el.textContent = pill.label;
-        pillContainer.appendChild(el);
-        pill.el = el;
+    function destroyPills() {
+        for (const pill of pills) {
+            if (pill.el && pill.el.parentNode) pill.el.parentNode.removeChild(pill.el);
+            pill.el = null;
+        }
+        pills = [];
     }
+
+    // Only create pills on non-mobile viewports
+    if (canvas.clientWidth > MOBILE_MAX_WIDTH) {
+        createPills();
+    }
+    pillsInitialized = true;
 
     // ── WebGL2 Rendering Setup ──
     const gl = canvas.getContext('webgl2', { alpha: true, premultipliedAlpha: false });
